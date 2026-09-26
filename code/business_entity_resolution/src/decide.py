@@ -59,14 +59,16 @@ def predict_ensemble(df: pd.DataFrame, models: list, feat_cols: list, batch_size
     so averaging all 5 for test inference carries no leakage risk (see train.py's
     train_oof docstring).
 
-    Batched, and casts each batch rather than the whole dataframe at once —
-    `df[feat_cols].astype(np.float32)` on the full frame crashed with MemoryError in
-    train.py at full train scale (43.4M rows); the test set is comparable in size, so the
-    same fix applies here even though this is inference, not training."""
+    Batched; selects feat_cols ONCE before slicing (not per-batch — slicing rows on the full,
+    wider dataframe before narrowing columns crashed with MemoryError in train.py, same root
+    cause fixed there); and skips an explicit .astype(float32) — lgb.Booster.predict()
+    converts internally in C++, so a separate pandas-level cast is pure overhead (also
+    confirmed as a MemoryError cause in train.py — see experiments.md for both)."""
+    X_all = df[feat_cols]
     preds = np.zeros(len(df), dtype=np.float64)
     for start in range(0, len(df), batch_size):
         end = min(start + batch_size, len(df))
-        X_batch = df.iloc[start:end][feat_cols].astype(np.float32)
+        X_batch = X_all.iloc[start:end]
         for model in models:
             preds[start:end] += model.predict(X_batch, num_iteration=model.best_iteration) / len(models)
         del X_batch

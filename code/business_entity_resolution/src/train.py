@@ -102,8 +102,13 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_all, y, groups)):
         log(f"Fold {fold + 1}/{n_splits}: train={len(tr_idx):,} val={len(va_idx):,} "
             f"(val positives={y[va_idx].sum():,})")
-        X_tr = X_all.iloc[tr_idx].astype(np.float32)
-        X_va = X_all.iloc[va_idx].astype(np.float32)
+        # No explicit .astype(float32) here — lgb.Dataset converts internally in C++ when it
+        # constructs its own histogram-binned representation, so a separate pandas-level cast
+        # is pure overhead: it forces ANOTHER full-size copy on top of the .iloc[] slice
+        # itself, which is exactly what crashed a fold's ~35M-row training slice with
+        # MemoryError even after every other fix (see experiments.md).
+        X_tr = X_all.iloc[tr_idx]
+        X_va = X_all.iloc[va_idx]
         train_set = lgb.Dataset(X_tr, label=y[tr_idx])
         val_set = lgb.Dataset(X_va, label=y[va_idx], reference=train_set)
         params = dict(LGB_PARAMS, seed=seed + fold)
