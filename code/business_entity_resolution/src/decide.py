@@ -25,10 +25,18 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def read_features_parquet(path) -> pd.DataFrame:
+    """Same fix as train.py's read_features_parquet — plain pd.read_parquet() crashed with
+    a MemoryError at full scale because the id columns as plain `object` dtype means one
+    Python string object per row. strings_to_categorical=True stores each unique id once."""
+    return pq.read_table(path).to_pandas(strings_to_categorical=True)
 
 
 def load_models(model_dir: Path) -> tuple[list, list, float]:
@@ -53,7 +61,7 @@ def apply_exclusivity(df: pd.DataFrame, prob_col: str = "prob") -> pd.DataFrame:
     """Each candidate goes to its single best-scoring S1 only (confirmed hard rule —
     0/7,638,365 violations in the real ground truth, see experiments.md). Same
     implementation as train.py's apply_exclusivity, applied here to test predictions."""
-    idx = df.groupby("candidate_entity_id")[prob_col].idxmax()
+    idx = df.groupby("candidate_entity_id", observed=True)[prob_col].idxmax()
     out = df.copy()
     keep = out.index.isin(set(idx))
     out.loc[~keep, prob_col] = -1.0
@@ -63,7 +71,7 @@ def apply_exclusivity(df: pd.DataFrame, prob_col: str = "prob") -> pd.DataFrame:
 def write_matching_results(df: pd.DataFrame, all_s1_ids: pd.Series, threshold: float, out_path: Path,
                             prob_col: str = "prob") -> None:
     passed = df[df[prob_col] > threshold]
-    grouped = passed.groupby("source1_entity_id")["candidate_entity_id"].apply(
+    grouped = passed.groupby("source1_entity_id", observed=True)["candidate_entity_id"].apply(
         lambda ids: ",".join(sorted(set(ids)))
     )
     result = pd.DataFrame({"source1_entity_id": all_s1_ids})
@@ -99,7 +107,7 @@ def main() -> None:
         f"({'override' if args.threshold is not None else 'from training'})")
 
     log(f"Loading features from {args.features}...")
-    df = pd.read_parquet(args.features)
+    df = read_features_parquet(args.features)
     log(f"  {len(df):,} candidate pairs, {df['source1_entity_id'].nunique():,} S1 entities with candidates")
 
     df["prob"] = predict_ensemble(df, models, feat_cols)

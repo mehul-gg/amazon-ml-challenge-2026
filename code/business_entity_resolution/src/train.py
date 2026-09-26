@@ -25,9 +25,20 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from sklearn.model_selection import GroupKFold
 
 from metric import parse_id_list, score_breakdown
+
+
+def read_features_parquet(path) -> pd.DataFrame:
+    """Plain pd.read_parquet() crashed with a MemoryError at full train scale (43.4M rows):
+    the two id columns as plain `object` dtype means one Python string object per row (over
+    86M of them total) — far heavier than the ~900MB on-disk size suggests. Reading via
+    pyarrow with strings_to_categorical=True stores each unique id once (there are only
+    ~2.2M unique S1 ids and a few million unique candidate ids, not 43M) instead of one
+    Python object per row. Same fix needed in decide.py, which reads this same file shape."""
+    return pq.read_table(path).to_pandas(strings_to_categorical=True)
 
 FEATURE_PREFIX = "f_"
 LGB_PARAMS = dict(
@@ -57,7 +68,10 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     test data, so there's no leakage risk in using all 5)."""
     X = df[feat_cols].astype(np.float32)
     y = df["label"].to_numpy()
-    groups = df["source1_entity_id"].to_numpy()
+    # .cat.codes, not .to_numpy() directly — the latter decodes every row back into a full
+    # string object again, undoing the memory savings from reading as categorical (only the
+    # integer codes are needed for grouping, not the actual id strings).
+    groups = df["source1_entity_id"].cat.codes.to_numpy()
 
     oof = np.zeros(len(df), dtype=np.float64)
     importances = np.zeros(len(feat_cols), dtype=np.float64)
@@ -92,7 +106,7 @@ def save_models(models: list, feat_cols: list, best_threshold: float, model_dir:
 def apply_exclusivity(df: pd.DataFrame, prob_col: str = "oof_prob") -> pd.DataFrame:
     """Each candidate goes to its single best-scoring S1 only (confirmed hard rule —
     0/7,638,365 violations in the real ground truth, see experiments.md)."""
-    idx = df.groupby("candidate_entity_id")[prob_col].idxmax()
+    idx = df.groupby("candidate_entity_id", observed=True)[prob_col].idxmax()
     out = df.copy()
     keep = out.index.isin(set(idx))
     out.loc[~keep, prob_col] = -1.0  # excluded candidates can never pass any positive threshold
@@ -130,7 +144,7 @@ def main() -> None:
     args = ap.parse_args()
 
     log(f"Loading {args.features}...")
-    df = pd.read_parquet(args.features)
+    df = read_features_parquet(args.features)
     feat_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
     log(f"Loaded {len(df):,} pairs, {len(feat_cols)} features, {df['label'].sum():,} positives "
         f"({df['label'].mean():.2%})")
