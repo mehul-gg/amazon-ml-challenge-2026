@@ -61,14 +61,17 @@ def predict_ensemble(df: pd.DataFrame, models: list, feat_cols: list, batch_size
 
     Batched; selects feat_cols ONCE before slicing (not per-batch — slicing rows on the full,
     wider dataframe before narrowing columns crashed with MemoryError in train.py, same root
-    cause fixed there); and skips an explicit .astype(float32) — lgb.Booster.predict()
-    converts internally in C++, so a separate pandas-level cast is pure overhead (also
-    confirmed as a MemoryError cause in train.py — see experiments.md for both)."""
+    cause fixed there). Each batch IS cast to float32 explicitly — turns out that omission
+    was wrong, not the fix: LightGBM's internal pandas->numpy conversion picks a dtype wide
+    enough for whatever mix of column dtypes it's given, which meant float64 (8 bytes) for a
+    mixed float32/int32/bool frame, not float32 — confirmed as train.py's actual root cause
+    (6.73GB for one training fold). A batch here is small (5M rows) so casting it explicitly
+    is cheap and avoids that same internal upcast."""
     X_all = df[feat_cols]
     preds = np.zeros(len(df), dtype=np.float64)
     for start in range(0, len(df), batch_size):
         end = min(start + batch_size, len(df))
-        X_batch = X_all.iloc[start:end]
+        X_batch = X_all.iloc[start:end].astype(np.float32)
         for model in models:
             preds[start:end] += model.predict(X_batch, num_iteration=model.best_iteration) / len(models)
         del X_batch

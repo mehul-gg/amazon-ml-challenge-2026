@@ -87,13 +87,24 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     # string object again, undoing the memory savings from reading as categorical (only the
     # integer codes are needed for grouping, not the actual id strings).
     groups = df["source1_entity_id"].cat.codes.to_numpy()
-    # Select the numeric feature columns ONCE, before any fold slicing — narrows df from 28
-    # columns (including the two categorical id columns) down to just the 26 numeric ones
-    # that training actually needs. `df.iloc[tr_idx]` on the FULL (28-column) dataframe
-    # crashed with MemoryError at full train scale: pandas' row-take machinery processes
-    # every column's block regardless of which ones get selected afterward, so slicing rows
-    # before narrowing columns dragged the id columns along for no reason.
-    X_all = df[feat_cols]
+    # Build ONE uniform float32 numpy array, column by column, rather than a pandas
+    # DataFrame with each column's own dtype (float32/int32/bool after features.py's
+    # downcast). Two things went wrong with the DataFrame approach at full scale:
+    #   1. df.iloc[tr_idx] on the FULL (28-column, including the two categorical id
+    #      columns) dataframe crashed — pandas' row-take processes every column's block
+    #      regardless of which get selected afterward.
+    #   2. Even after narrowing to just feat_cols, lgb.Dataset()'s *internal* pandas->numpy
+    #      conversion picks a dtype wide enough to safely hold every column's values when
+    #      they're mixed types — which meant float64 (8 bytes), not float32, needing 6.73GB
+    #      for one ~35M-row fold alone (confirmed in the traceback). Handing LightGBM an
+    #      already-uniform float32 array sidesteps that entirely.
+    # Converting one column at a time (not `df[feat_cols].to_numpy(dtype=np.float32)` in one
+    # call) keeps peak memory to "one small column plus the growing output array" instead of
+    # "the full old mixed-dtype block plus the full new array" at once.
+    n_rows = len(df)
+    X_all = np.empty((n_rows, len(feat_cols)), dtype=np.float32)
+    for i, col in enumerate(feat_cols):
+        X_all[:, i] = df[col].to_numpy(dtype=np.float32)
 
     oof = np.zeros(len(y), dtype=np.float64)
     importances = np.zeros(len(feat_cols), dtype=np.float64)
@@ -102,15 +113,13 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_all, y, groups)):
         log(f"Fold {fold + 1}/{n_splits}: train={len(tr_idx):,} val={len(va_idx):,} "
             f"(val positives={y[va_idx].sum():,})")
-        # No explicit .astype(float32) here — lgb.Dataset converts internally in C++ when it
-        # constructs its own histogram-binned representation, so a separate pandas-level cast
-        # is pure overhead: it forces ANOTHER full-size copy on top of the .iloc[] slice
-        # itself, which is exactly what crashed a fold's ~35M-row training slice with
-        # MemoryError even after every other fix (see experiments.md).
-        X_tr = X_all.iloc[tr_idx]
-        X_va = X_all.iloc[va_idx]
-        train_set = lgb.Dataset(X_tr, label=y[tr_idx])
-        val_set = lgb.Dataset(X_va, label=y[va_idx], reference=train_set)
+        # Plain numpy fancy-indexing on an already-uniform float32 array — cheap, no dtype
+        # promotion surprises (unlike pandas .iloc on a mixed-dtype frame; see train_oof's
+        # docstring-adjacent comment above X_all's construction for the full story).
+        X_tr = X_all[tr_idx]
+        X_va = X_all[va_idx]
+        train_set = lgb.Dataset(X_tr, label=y[tr_idx], feature_name=feat_cols)
+        val_set = lgb.Dataset(X_va, label=y[va_idx], reference=train_set, feature_name=feat_cols)
         params = dict(LGB_PARAMS, seed=seed + fold)
         model = lgb.train(
             params, train_set, num_boost_round=500,
