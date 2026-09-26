@@ -31,9 +31,14 @@ from rapidfuzz import fuzz
 
 from metric import parse_id_list
 
+# Only the columns compute_features() actually reads. Originally included business_name,
+# business_address, country and name_clean too — none of which any feature uses — which
+# meant rec.reindex() (called twice per batch, once per side of the pair) was needlessly
+# carrying full raw-text columns through a 43.4M-row operation. Confirmed as the direct
+# cause of a MemoryError at full train scale (see experiments.md); trimming this list is
+# the fix, same "column pushdown" principle as blocking.py's BLOCKING_COLS.
 FULL_COLS = [
-    "entity_id", "country", "business_name", "business_address",
-    "name_clean", "name_core", "legal_suffix", "name_has_phone",
+    "entity_id", "name_core", "legal_suffix", "name_has_phone",
     "address_clean", "postal_code", "house_number", "has_landmark",
 ]
 
@@ -74,10 +79,9 @@ def _norm_len(s: str) -> int:
     return len(s) if isinstance(s, str) else 0
 
 
-def compute_features(pairs: pd.DataFrame, rec: pd.DataFrame) -> pd.DataFrame:
-    """rec: entity_id-indexed frame with FULL_COLS (minus entity_id) for every S1 and candidate
-    referenced in `pairs`. Returns pairs with feature columns appended."""
-    log(f"Computing features for {len(pairs):,} pairs...")
+def _compute_features_batch(pairs: pd.DataFrame, rec: pd.DataFrame) -> pd.DataFrame:
+    """One batch's worth of the actual feature computation — see compute_features for why
+    this is called in chunks rather than once over the whole dataset."""
     a = rec.reindex(pairs["source1_entity_id"]).reset_index(drop=True)
     b = rec.reindex(pairs["candidate_entity_id"]).reset_index(drop=True)
     out = pairs.reset_index(drop=True).copy()
@@ -145,6 +149,27 @@ def compute_features(pairs: pd.DataFrame, rec: pd.DataFrame) -> pd.DataFrame:
     out["f_name_len_b"] = name_b.map(_norm_len)
     out["f_name_len_diff"] = (out["f_name_len_a"] - out["f_name_len_b"]).abs()
 
+    return out
+
+
+def compute_features(pairs: pd.DataFrame, rec: pd.DataFrame, batch_size: int = 2_000_000) -> pd.DataFrame:
+    """rec: entity_id-indexed frame with FULL_COLS (minus entity_id) for every S1 and candidate
+    referenced in `pairs`. Returns pairs with feature columns appended.
+
+    Processes `pairs` in batches: `rec.reindex(...)` builds a full copy of rec's columns
+    aligned to every row of whatever it's given, done twice per call (once per side of the
+    pair). At full train scale (43.4M pairs) that reindex alone raised a MemoryError even
+    after trimming rec to only the columns features actually use (see FULL_COLS) — batching
+    bounds how many rows are reindexed at once, same chunking principle as blocking.py.
+    """
+    log(f"Computing features for {len(pairs):,} pairs in batches of {batch_size:,}...")
+    results = []
+    for start in range(0, len(pairs), batch_size):
+        batch = pairs.iloc[start : start + batch_size]
+        results.append(_compute_features_batch(batch, rec))
+        gc.collect()
+        log(f"  {min(start + batch_size, len(pairs)):,} / {len(pairs):,} pairs done")
+    out = pd.concat(results, ignore_index=True) if len(results) > 1 else results[0]
     log(f"Done. {out.shape[1] - 2} feature columns.")
     return out
 
@@ -162,11 +187,22 @@ def attach_labels(features: pd.DataFrame, gt_path: Path) -> pd.DataFrame:
         true_pairs["candidate_entity_id"].notna() & (true_pairs["candidate_entity_id"] != ""),
         ["source1_entity_id", "candidate_entity_id"],
     ].copy()
-    true_pairs["label"] = 1
-    features = features.merge(
-        true_pairs, on=["source1_entity_id", "candidate_entity_id"], how="left"
-    )
-    features["label"] = features["label"].fillna(0).astype(int)
+    # A two-column string merge here crashed with MemoryError at full train scale (43.4M
+    # rows x 7.6M ground-truth pairs) — same root cause and same fix as blocking.py's
+    # measure_recall: encode both id columns to compact int64 codes (shared factorization
+    # across both frames) and compare with numpy instead of pandas' string-based join.
+    all_s1 = pd.concat([features["source1_entity_id"], true_pairs["source1_entity_id"]], ignore_index=True)
+    s1_codes, _ = pd.factorize(all_s1)
+    all_cand = pd.concat([features["candidate_entity_id"], true_pairs["candidate_entity_id"]], ignore_index=True)
+    cand_codes, cand_uniques = pd.factorize(all_cand)
+    n_cand = len(cand_uniques)
+
+    n_feat = len(features)
+    feat_key = s1_codes[:n_feat].astype(np.int64) * n_cand + cand_codes[:n_feat].astype(np.int64)
+    true_key = s1_codes[n_feat:].astype(np.int64) * n_cand + cand_codes[n_feat:].astype(np.int64)
+    true_key_sorted = np.sort(np.unique(true_key))
+    features = features.copy()
+    features["label"] = np.isin(feat_key, true_key_sorted).astype(int)
     return features
 
 

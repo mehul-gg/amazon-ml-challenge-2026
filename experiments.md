@@ -166,6 +166,50 @@ proper shared-memory design if blocking needs to be rerun many more times.
 **Attempt 6 launched 11:50** (no checkpoint existed yet from attempt 5, so India recomputes once
 more; from now on a crash won't lose a completed country's work).
 
+## Full-train blocking: SUCCESS (26 Sep, attempt 6)
+
+Both countries completed and checkpointed:
+- India: 17,522,668 pairs (20,213.2s wall-clock this attempt)
+- US: 25,878,257 pairs (8,873.1s wall-clock)
+- **Total: 43,400,925 candidate pairs**, written to `artifacts/candidate_pairs_train_full.tsv`
+  (2,206,821 rows — full S1 coverage) and `artifacts/candidate_scores_train.parquet` (with score
+  + rank, for feature engineering).
+
+`measure_recall` then crashed with `MemoryError` — but only in the diagnostic step, *after* both
+output files were already safely written. Root cause: its pandas two-column merge (43.4M
+candidate pairs x 7.6M ground-truth pairs) needed more memory than was available for the
+internal join factorization. Fixed the same way as normalize.py's earlier bugs — avoid heavy
+string-object structures at this row count. First fix attempt (string-concat + Python set) also
+crashed; the working fix encodes both id columns to compact int64 codes (shared factorization
+across both frames) and compares with `numpy.isin` — dense integer arrays instead of strings/
+tuples/sets, dramatically lighter at this scale.
+
+**Real full-scale recall: 56.10%** (4,285,280 / 7,638,365) — matches the 50k-sample estimate
+(56.24%) almost exactly, confirming the sample-based calibration was representative all along.
+Only 55 / 2,083,574 S1s with a true match got zero candidates (0.0026%) — negligible, consistent
+with the sample's "0 zero-candidate failures" finding at a scale where a handful of edge cases
+are expected.
+
+**CPU-time monitoring during this run** (via `Get-Process`, not wall-clock) showed real,
+observable variance in utilization: some windows near 100% CPU (steady progress), one ~1h
+stretch at only ~6% (likely sleep or memory-pressure thrashing) — confirms `time.time()`-based
+elapsed logging in these scripts still isn't a reliable duration signal on this machine; only
+`Get-Process`'s cumulative CPU time is.
+
+**Next**: run `features.py` on the full 43.4M-pair set, retrain `train.py` (now saves models via
+`--model-dir`, see the `decide.py` addition below) to get a real full-scale OOF score, then move
+to test-set blocking.
+
+## decide.py added + train.py now persists models (26 Sep)
+
+`train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
+data, which has no fold assignment. Added `save_models()`: each fold's booster
+(`fold_{i}.txt`), the feature-column list, and the tuned threshold go to `--model-dir/meta.json`.
+`decide.py` (new): loads that ensemble, averages all folds' predictions (standard bagging — no
+leakage risk since no fold ever saw test data), enforces exclusivity, applies the threshold, and
+writes `matching_results.tsv` + copies `candidate_pairs.tsv` through unchanged (already in the
+exact required format).
+
 **Defaults landed on**: `--max-df 50000` (calibrated middle ground — lower drops legitimate keys,
 higher reintroduces expensive joins), `--top-r-tokens 3`, `--s1-chunk-size 50000` (memory-only
 concern now, not a join-size safety net), `k=20` candidates per S1.

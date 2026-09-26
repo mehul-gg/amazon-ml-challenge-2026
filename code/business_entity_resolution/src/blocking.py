@@ -330,9 +330,23 @@ def measure_recall(pairs: pd.DataFrame, gt_path: Path, scope_s1_ids: pd.Series) 
     n_true = len(gt_pairs)
     log(f"Ground-truth matched pairs within scope ({len(scope_s1_ids):,} S1s queried): {n_true:,}")
 
-    have = pairs[["source1_entity_id", "candidate_entity_id"]].drop_duplicates()
-    hit = gt_pairs.merge(have.assign(_hit=True), on=["source1_entity_id", "candidate_entity_id"], how="left")
-    n_hit = hit["_hit"].notna().sum()
+    # Both a two-column pandas merge AND a string-concat-then-set approach hit MemoryError at
+    # full scale (43.4M candidate pairs x 7.6M ground-truth pairs) — string objects (whether in
+    # a pandas join's internal factorization or a Python set of concatenated strings) are just
+    # too heavy at this row count. Encoding both id columns to compact int64 codes (shared
+    # factorization across both frames, so codes mean the same thing in each) and comparing
+    # those with numpy instead keeps everything in dense integer arrays — dramatically lighter.
+    all_s1_ids = pd.concat([pairs["source1_entity_id"], gt_pairs["source1_entity_id"]], ignore_index=True)
+    s1_codes, s1_uniques = pd.factorize(all_s1_ids)
+    all_cand_ids = pd.concat([pairs["candidate_entity_id"], gt_pairs["candidate_entity_id"]], ignore_index=True)
+    cand_codes, cand_uniques = pd.factorize(all_cand_ids)
+    n_cand = len(cand_uniques)
+
+    n_pairs = len(pairs)
+    have_key = s1_codes[:n_pairs].astype(np.int64) * n_cand + cand_codes[:n_pairs].astype(np.int64)
+    gt_key = s1_codes[n_pairs:].astype(np.int64) * n_cand + cand_codes[n_pairs:].astype(np.int64)
+    have_key_sorted = np.sort(np.unique(have_key))
+    n_hit = int(np.isin(gt_key, have_key_sorted, assume_unique=False).sum())
     recall = n_hit / n_true if n_true else 0.0
     print(f"\n===== BLOCKING RECALL =====")
     print(f"Recall (true matches found in candidate set): {n_hit:,} / {n_true:,} = {recall:.4%}")
