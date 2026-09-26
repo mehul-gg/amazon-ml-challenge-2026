@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from rapidfuzz import fuzz
 
 from metric import parse_id_list
@@ -152,33 +154,11 @@ def _compute_features_batch(pairs: pd.DataFrame, rec: pd.DataFrame) -> pd.DataFr
     return out
 
 
-def compute_features(pairs: pd.DataFrame, rec: pd.DataFrame, batch_size: int = 2_000_000) -> pd.DataFrame:
-    """rec: entity_id-indexed frame with FULL_COLS (minus entity_id) for every S1 and candidate
-    referenced in `pairs`. Returns pairs with feature columns appended.
-
-    Processes `pairs` in batches: `rec.reindex(...)` builds a full copy of rec's columns
-    aligned to every row of whatever it's given, done twice per call (once per side of the
-    pair). At full train scale (43.4M pairs) that reindex alone raised a MemoryError even
-    after trimming rec to only the columns features actually use (see FULL_COLS) — batching
-    bounds how many rows are reindexed at once, same chunking principle as blocking.py.
-    """
-    log(f"Computing features for {len(pairs):,} pairs in batches of {batch_size:,}...")
-    results = []
-    for start in range(0, len(pairs), batch_size):
-        batch = pairs.iloc[start : start + batch_size]
-        results.append(_compute_features_batch(batch, rec))
-        gc.collect()
-        log(f"  {min(start + batch_size, len(pairs)):,} / {len(pairs):,} pairs done")
-    out = pd.concat(results, ignore_index=True) if len(results) > 1 else results[0]
-    log(f"Done. {out.shape[1] - 2} feature columns.")
-    return out
-
-
-def attach_labels(features: pd.DataFrame, gt_path: Path) -> pd.DataFrame:
-    # Filter ground truth to just the S1s actually present BEFORE exploding — the full
-    # ground truth explodes to 7.6M pairs; scoping first keeps this proportional to the
-    # sample size instead of the full dataset (same fix as blocking.py's measure_recall).
-    scope = set(features["source1_entity_id"])
+def _build_gt_key_set(gt_path: Path, scope: set) -> set:
+    """A Python set of combined 'source1_entity_id\\x01candidate_entity_id' strings for every
+    true match — built ONCE (this set is small enough: 7.6M keys at full train scale) and
+    reused across every batch's label lookup, so labeling never needs the full feature set
+    and the full ground truth in memory together (see compute_and_write_features)."""
     gt = pd.read_csv(gt_path, sep="\t", dtype=str, keep_default_na=False)
     gt = gt[gt["source1_entity_id"].isin(scope)]
     match_lists = gt["matched_entity_ids"].map(parse_id_list)
@@ -186,24 +166,62 @@ def attach_labels(features: pd.DataFrame, gt_path: Path) -> pd.DataFrame:
     true_pairs = true_pairs.loc[
         true_pairs["candidate_entity_id"].notna() & (true_pairs["candidate_entity_id"] != ""),
         ["source1_entity_id", "candidate_entity_id"],
-    ].copy()
-    # A two-column string merge here crashed with MemoryError at full train scale (43.4M
-    # rows x 7.6M ground-truth pairs) — same root cause and same fix as blocking.py's
-    # measure_recall: encode both id columns to compact int64 codes (shared factorization
-    # across both frames) and compare with numpy instead of pandas' string-based join.
-    all_s1 = pd.concat([features["source1_entity_id"], true_pairs["source1_entity_id"]], ignore_index=True)
-    s1_codes, _ = pd.factorize(all_s1)
-    all_cand = pd.concat([features["candidate_entity_id"], true_pairs["candidate_entity_id"]], ignore_index=True)
-    cand_codes, cand_uniques = pd.factorize(all_cand)
-    n_cand = len(cand_uniques)
+    ]
+    return set(true_pairs["source1_entity_id"] + "\x01" + true_pairs["candidate_entity_id"])
 
-    n_feat = len(features)
-    feat_key = s1_codes[:n_feat].astype(np.int64) * n_cand + cand_codes[:n_feat].astype(np.int64)
-    true_key = s1_codes[n_feat:].astype(np.int64) * n_cand + cand_codes[n_feat:].astype(np.int64)
-    true_key_sorted = np.sort(np.unique(true_key))
-    features = features.copy()
-    features["label"] = np.isin(feat_key, true_key_sorted).astype(int)
-    return features
+
+def compute_and_write_features(
+    pairs: pd.DataFrame, rec: pd.DataFrame, out_path: Path, gt_path: Path | None,
+    batch_size: int = 2_000_000,
+) -> int:
+    """Computes features (and, if `gt_path` is given, the label) in batches and streams each
+    batch straight to `out_path` via a single incrementally-written parquet file — never
+    holding more than one batch's results in memory.
+
+    This replaced an earlier version that computed all batches into a Python list and
+    concatenated them at the end: at full train scale (43.4M pairs) that final concat alone
+    needed as much memory as the un-batched version would have, defeating the point of
+    batching in the first place (confirmed: MemoryError in pd.concat after all 22 batches'
+    worth of computation had already succeeded — see experiments.md). Streaming to disk
+    avoids ever materializing the full result at all.
+    """
+    gt_keys = None
+    if gt_path is not None:
+        log("Building ground-truth key set (once, reused across all batches)...")
+        gt_keys = _build_gt_key_set(gt_path, set(pairs["source1_entity_id"]))
+        log(f"  {len(gt_keys):,} ground-truth pairs in scope")
+
+    log(f"Computing features for {len(pairs):,} pairs in batches of {batch_size:,}, "
+        f"streaming to {out_path}...")
+    writer = None
+    n_written = 0
+    n_positive = 0
+    try:
+        for start in range(0, len(pairs), batch_size):
+            batch = pairs.iloc[start : start + batch_size]
+            feat = _compute_features_batch(batch, rec)
+            if gt_keys is not None:
+                key = feat["source1_entity_id"] + "\x01" + feat["candidate_entity_id"]
+                feat["label"] = key.isin(gt_keys).astype(int)
+                n_positive += int(feat["label"].sum())
+            table = pa.Table.from_pandas(feat, preserve_index=False)
+            if writer is None:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                writer = pq.ParquetWriter(str(out_path), table.schema)
+            writer.write_table(table)
+            n_written += len(feat)
+            del feat, table
+            gc.collect()
+            log(f"  {min(start + batch_size, len(pairs)):,} / {len(pairs):,} pairs done")
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if gt_keys is not None:
+        log(f"Wrote {n_written:,} rows, {n_positive:,} positives ({n_positive / max(n_written, 1):.2%})")
+    else:
+        log(f"Wrote {n_written:,} rows")
+    return n_written
 
 
 def main() -> None:
@@ -240,20 +258,11 @@ def main() -> None:
     gc.collect()
     log(f"Combined filtered record lookup: {len(rec):,} rows")
 
-    features = compute_features(pairs, rec)
+    gt_path = (data_dir / "train" / "train_ground_truth.tsv") if args.split == "train" else None
+    out_path = Path(args.out)
+    compute_and_write_features(pairs, rec, out_path, gt_path)
     del rec
     gc.collect()
-
-    if args.split == "train":
-        log("Attaching ground-truth labels...")
-        features = attach_labels(features, data_dir / "train" / "train_ground_truth.tsv")
-        log(f"  positives: {features['label'].sum():,} / {len(features):,} "
-            f"({features['label'].mean():.2%})")
-
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(out_path, index=False)
-    log(f"Wrote {len(features):,} rows x {features.shape[1]} cols to {out_path}")
 
 
 if __name__ == "__main__":
