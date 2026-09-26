@@ -200,6 +200,36 @@ elapsed logging in these scripts still isn't a reliable duration signal on this 
 `--model-dir`, see the `decide.py` addition below) to get a real full-scale OOF score, then move
 to test-set blocking.
 
+## Full train_oof memory debugging arc, then strategy pivot (26 Sep)
+
+Training LightGBM on all 43.4M rows hit a long chain of full-scale-only memory issues, each
+fixed in turn (see the commit history for exact details): mixed-dtype feature columns forcing
+float64 upcasts inside both pandas and LightGBM's internal conversion, `df.iloc[]` on the full
+28-column frame dragging id columns along unnecessarily, a fold's ~35M-row training slice and
+the full 43.4M-row X_all needing to coexist in memory. The dtype fix (float32/int32/int8
+throughout) and building X_all as one column-by-column-constructed array were real, confirmed
+improvements — each got the crash further before the next bottleneck appeared, and each was
+verified byte-for-byte / value-identical against the known-good 50k-sample result before being
+trusted at scale.
+
+The X_all-vs-fold-slice memory conflict was fixed by backing X_all with a memory-mapped file
+(consistent with this project's earlier diagnosis that Windows' virtual-memory *commit limit*,
+not physical RAM, is the tighter constraint on this machine) — but this then hit a **native
+access violation inside LightGBM's C library** (`LGBM_DatasetCreateFromMat`), not a catchable
+Python `MemoryError`. This is a different class of problem: LightGBM's low-level array handling
+doesn't appear to interact safely with memmap-backed numpy arrays on Windows, and debugging a
+native crash inside a compiled C extension is a much larger, less certain time investment than
+the pure-Python memory fixes so far.
+
+**Decision: stop pushing full 43.4M-row training through this machine, train on a large
+subsample instead.** Full-scale blocking (43.4M pairs, 56.1% recall) and full-scale feature
+computation (894MB parquet, correct/verified) both already succeeded — that work isn't wasted.
+`sample_features.py` (new) samples ~400-500k S1 entities' worth of rows directly from the
+already-computed `features_train_full.parquet` via pyarrow predicate pushdown (never loads the
+full file), giving ~8-10M pairs — comfortably within memory territory already proven reliable
+(the 50k sample's ~983k pairs trained without issue), while being a substantially larger and
+more representative training set than the original 50k-S1 development sample.
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
