@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 import time
@@ -34,11 +35,26 @@ from metric import parse_id_list, score_breakdown
 def read_features_parquet(path) -> pd.DataFrame:
     """Plain pd.read_parquet() crashed with a MemoryError at full train scale (43.4M rows):
     the two id columns as plain `object` dtype means one Python string object per row (over
-    86M of them total) — far heavier than the ~900MB on-disk size suggests. Reading via
-    pyarrow with strings_to_categorical=True stores each unique id once (there are only
-    ~2.2M unique S1 ids and a few million unique candidate ids, not 43M) instead of one
-    Python object per row. Same fix needed in decide.py, which reads this same file shape."""
-    return pq.read_table(path).to_pandas(strings_to_categorical=True)
+    86M of them total) — far heavier than the ~900MB on-disk size suggests.
+
+    Reading the WHOLE table at once via pyarrow with strings_to_categorical=True (an earlier
+    fix attempt) still crashed: pq.read_table() builds the full Arrow table — all 28 columns,
+    strings included, in Arrow's own (still substantial) in-memory format — before any
+    conversion to pandas / categorical happens at all, so that intermediate step alone needs
+    peak memory close to what loading everything as-is would.
+
+    Fix: read the 26 numeric feature + label columns together (cheap — no strings at all),
+    and read each of the two id columns as its OWN separate single-column read, converted to
+    categorical immediately. Splitting the reads means the string columns' data is never in
+    memory at the same time as the full numeric block during the same read call. Same
+    approach needed in decide.py, which reads this same file shape."""
+    schema_cols = pq.read_schema(path).names
+    numeric_cols = [c for c in schema_cols if c.startswith("f_") or c == "label"]
+    df = pd.read_parquet(path, columns=numeric_cols)
+    for id_col in ("source1_entity_id", "candidate_entity_id"):
+        if id_col in schema_cols:
+            df[id_col] = pq.read_table(path, columns=[id_col]).to_pandas(strings_to_categorical=True)[id_col]
+    return df
 
 FEATURE_PREFIX = "f_"
 LGB_PARAMS = dict(
@@ -66,7 +82,6 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     them means calling .predict() on saved models directly, averaged across folds (a
     standard bagging ensemble — every fold's model saw ~80% of train, none of it saw any
     test data, so there's no leakage risk in using all 5)."""
-    X = df[feat_cols].astype(np.float32)
     y = df["label"].to_numpy()
     # .cat.codes, not .to_numpy() directly — the latter decodes every row back into a full
     # string object again, undoing the memory savings from reading as categorical (only the
@@ -77,19 +92,30 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     importances = np.zeros(len(feat_cols), dtype=np.float64)
     models = []
     gkf = GroupKFold(n_splits=n_splits)
-    for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y, groups)):
+    # Slice ROWS first (df.iloc[idx]), then select feat_cols and cast — not the other way
+    # round. `df[feat_cols].astype(np.float32)` on the FULL dataframe before any fold
+    # slicing crashed with MemoryError at full train scale (43.4M rows): selecting+casting
+    # every feature column at once needs a full-size temporary array, and LightGBM doesn't
+    # actually need a pre-cast float32 matrix at all — it converts internally on Dataset
+    # construction. Casting per-fold-slice (a train slice is ~80% of the data, still large,
+    # but this avoids ever holding a *whole extra* full-dataset-sized copy at once).
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(df, y, groups)):
         log(f"Fold {fold + 1}/{n_splits}: train={len(tr_idx):,} val={len(va_idx):,} "
             f"(val positives={y[va_idx].sum():,})")
-        train_set = lgb.Dataset(X.iloc[tr_idx], label=y[tr_idx])
-        val_set = lgb.Dataset(X.iloc[va_idx], label=y[va_idx], reference=train_set)
+        X_tr = df.iloc[tr_idx][feat_cols].astype(np.float32)
+        X_va = df.iloc[va_idx][feat_cols].astype(np.float32)
+        train_set = lgb.Dataset(X_tr, label=y[tr_idx])
+        val_set = lgb.Dataset(X_va, label=y[va_idx], reference=train_set)
         params = dict(LGB_PARAMS, seed=seed + fold)
         model = lgb.train(
             params, train_set, num_boost_round=500,
             valid_sets=[val_set],
             callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)],
         )
-        oof[va_idx] = model.predict(X.iloc[va_idx], num_iteration=model.best_iteration)
+        oof[va_idx] = model.predict(X_va, num_iteration=model.best_iteration)
         importances += model.feature_importance(importance_type="gain")
+        del X_tr, X_va, train_set, val_set
+        gc.collect()
         models.append(model)
     return oof, importances / n_splits, models
 

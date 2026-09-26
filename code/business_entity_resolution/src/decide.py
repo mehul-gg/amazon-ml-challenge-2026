@@ -33,10 +33,18 @@ def log(msg: str) -> None:
 
 
 def read_features_parquet(path) -> pd.DataFrame:
-    """Same fix as train.py's read_features_parquet — plain pd.read_parquet() crashed with
-    a MemoryError at full scale because the id columns as plain `object` dtype means one
-    Python string object per row. strings_to_categorical=True stores each unique id once."""
-    return pq.read_table(path).to_pandas(strings_to_categorical=True)
+    """Same fix as train.py's read_features_parquet (see its docstring for the full story:
+    reading the whole table via pq.read_table() at once still crashed even with
+    strings_to_categorical=True, because that builds the full Arrow table — strings
+    included — before any conversion happens). Read numeric columns together, id columns
+    separately."""
+    schema_cols = pq.read_schema(path).names
+    numeric_cols = [c for c in schema_cols if c.startswith("f_") or c == "label"]
+    df = pd.read_parquet(path, columns=numeric_cols)
+    for id_col in ("source1_entity_id", "candidate_entity_id"):
+        if id_col in schema_cols:
+            df[id_col] = pq.read_table(path, columns=[id_col]).to_pandas(strings_to_categorical=True)[id_col]
+    return df
 
 
 def load_models(model_dir: Path) -> tuple[list, list, float]:
@@ -45,15 +53,23 @@ def load_models(model_dir: Path) -> tuple[list, list, float]:
     return models, meta["feature_cols"], meta["best_threshold"]
 
 
-def predict_ensemble(df: pd.DataFrame, models: list, feat_cols: list) -> np.ndarray:
+def predict_ensemble(df: pd.DataFrame, models: list, feat_cols: list, batch_size: int = 5_000_000) -> np.ndarray:
     """Average all fold models' predictions — standard bagging. Every fold's model was
     trained on ~80% of train and validated on the rest; none of them ever saw test data,
     so averaging all 5 for test inference carries no leakage risk (see train.py's
-    train_oof docstring)."""
-    X = df[feat_cols].astype(np.float32)
+    train_oof docstring).
+
+    Batched, and casts each batch rather than the whole dataframe at once —
+    `df[feat_cols].astype(np.float32)` on the full frame crashed with MemoryError in
+    train.py at full train scale (43.4M rows); the test set is comparable in size, so the
+    same fix applies here even though this is inference, not training."""
     preds = np.zeros(len(df), dtype=np.float64)
-    for model in models:
-        preds += model.predict(X, num_iteration=model.best_iteration) / len(models)
+    for start in range(0, len(df), batch_size):
+        end = min(start + batch_size, len(df))
+        X_batch = df.iloc[start:end][feat_cols].astype(np.float32)
+        for model in models:
+            preds[start:end] += model.predict(X_batch, num_iteration=model.best_iteration) / len(models)
+        del X_batch
     return preds
 
 
