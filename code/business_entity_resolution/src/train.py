@@ -20,6 +20,7 @@ import argparse
 import gc
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -74,7 +75,8 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 0) -> tuple:
+def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 0,
+              memmap_dir: Path | None = None) -> tuple:
     """Returns (oof, importances, models) — `models` is the list of per-fold LightGBM
     boosters. These are what decide.py needs for inference on test data: OOF predictions
     alone (what this function used to return) are only useful for evaluating train, since
@@ -101,10 +103,29 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     # Converting one column at a time (not `df[feat_cols].to_numpy(dtype=np.float32)` in one
     # call) keeps peak memory to "one small column plus the growing output array" instead of
     # "the full old mixed-dtype block plus the full new array" at once.
+    #
+    # X_all itself is memory-mapped to a temp file, not a plain in-RAM array. Even after
+    # every fix above, X_all (~4.5GB at full train scale) and one fold's ~80% training slice
+    # (~3.4GB) needing to coexist genuinely exceeded available memory — not a bug at that
+    # point, a real resource limit (confirmed clean: the crash was for exactly
+    # rows*cols*4 bytes, no waste left to trim). Per this project's earlier diagnosis (see
+    # experiments.md — the Brave-browser virtual-memory-exhaustion incident), the tighter
+    # constraint on this machine is Windows' virtual memory *commit* limit, not raw physical
+    # RAM: a plain numpy array needs the OS to commit that much anonymous memory up front,
+    # while a memmap backed by a real file needs none of that — pages are read from disk on
+    # demand. Each fold's slice (materialized via fancy indexing on the memmap) still becomes
+    # a normal in-RAM array; only the full-dataset X_all avoids being one.
     n_rows = len(df)
-    X_all = np.empty((n_rows, len(feat_cols)), dtype=np.float32)
+    n_feat = len(feat_cols)
+    # The system temp dir (C:) had only ~5.5GB free on this machine — too tight for a
+    # multi-GB memmap file. Default to a caller-supplied directory (main() passes
+    # --artifacts, which lives on D: with tens of GB free) instead of tempfile.gettempdir().
+    memmap_root = memmap_dir if memmap_dir is not None else Path(tempfile.gettempdir())
+    memmap_path = memmap_root / f"train_X_all_{id(df)}.dat"
+    X_all = np.memmap(memmap_path, dtype=np.float32, mode="w+", shape=(n_rows, n_feat))
     for i, col in enumerate(feat_cols):
         X_all[:, i] = df[col].to_numpy(dtype=np.float32)
+    X_all.flush()
 
     oof = np.zeros(len(y), dtype=np.float64)
     importances = np.zeros(len(feat_cols), dtype=np.float64)
@@ -131,6 +152,9 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
         del X_tr, X_va, train_set, val_set
         gc.collect()
         models.append(model)
+    del X_all
+    gc.collect()
+    memmap_path.unlink(missing_ok=True)
     return oof, importances / n_splits, models
 
 
@@ -189,7 +213,9 @@ def main() -> None:
     log(f"Loaded {len(df):,} pairs, {len(feat_cols)} features, {df['label'].sum():,} positives "
         f"({df['label'].mean():.2%})")
 
-    oof, importances, models = train_oof(df, feat_cols, n_splits=args.folds)
+    memmap_dir = Path(args.out_oof).parent
+    memmap_dir.mkdir(parents=True, exist_ok=True)
+    oof, importances, models = train_oof(df, feat_cols, n_splits=args.folds, memmap_dir=memmap_dir)
     df["oof_prob"] = oof
 
     imp = pd.Series(importances, index=feat_cols).sort_values(ascending=False)
