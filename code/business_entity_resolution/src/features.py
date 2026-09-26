@@ -170,6 +170,24 @@ def _build_gt_key_set(gt_path: Path, scope: set) -> set:
     return set(true_pairs["source1_entity_id"] + "\x01" + true_pairs["candidate_entity_id"])
 
 
+def _downcast_features(feat: pd.DataFrame) -> pd.DataFrame:
+    """Store feature columns in compact dtypes instead of pandas' float64/int64 defaults —
+    rapidfuzz ratio/score features are 0-100 (or 0-1 for jaccard), already low-precision, so
+    float32 loses nothing that matters; string-length columns and the 0/1 label don't need
+    64 bits either. At full train scale (43.4M rows) this roughly halves the size of every
+    downstream in-memory feature matrix, which is what several MemoryErrors in
+    train.py/decide.py traced back to (see experiments.md) — better fixed once here than
+    patched in every consumer."""
+    for col in feat.columns:
+        if feat[col].dtype == np.float64:
+            feat[col] = feat[col].astype(np.float32)
+        elif feat[col].dtype == np.int64 and col != "label":
+            feat[col] = feat[col].astype(np.int32)
+    if "label" in feat.columns:
+        feat["label"] = feat["label"].astype(np.int8)
+    return feat
+
+
 def compute_and_write_features(
     pairs: pd.DataFrame, rec: pd.DataFrame, out_path: Path, gt_path: Path | None,
     batch_size: int = 2_000_000,
@@ -204,6 +222,7 @@ def compute_and_write_features(
                 key = feat["source1_entity_id"] + "\x01" + feat["candidate_entity_id"]
                 feat["label"] = key.isin(gt_keys).astype(int)
                 n_positive += int(feat["label"].sum())
+            feat = _downcast_features(feat)
             table = pa.Table.from_pandas(feat, preserve_index=False)
             if writer is None:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
