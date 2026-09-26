@@ -1,0 +1,14 @@
+# Day 1 — installed and in active use
+numpy==2.4.6
+pandas==2.3.3
+pyarrow==23.0.0
+scikit-learn==1.8.0
+scipy==1.17.0
+rapidfuzz==3.14.6
+lightgbm==4.7.0
+pytest
+torch==2.14.0  # present in the environment already; not yet used by any Day 1 script
+
+# Day 2 — planned (multilingual embedding retriever), NOT yet installed
+faiss-cpu
+sentence-transformers
