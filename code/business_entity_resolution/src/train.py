@@ -87,23 +87,23 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
     # string object again, undoing the memory savings from reading as categorical (only the
     # integer codes are needed for grouping, not the actual id strings).
     groups = df["source1_entity_id"].cat.codes.to_numpy()
+    # Select the numeric feature columns ONCE, before any fold slicing — narrows df from 28
+    # columns (including the two categorical id columns) down to just the 26 numeric ones
+    # that training actually needs. `df.iloc[tr_idx]` on the FULL (28-column) dataframe
+    # crashed with MemoryError at full train scale: pandas' row-take machinery processes
+    # every column's block regardless of which ones get selected afterward, so slicing rows
+    # before narrowing columns dragged the id columns along for no reason.
+    X_all = df[feat_cols]
 
-    oof = np.zeros(len(df), dtype=np.float64)
+    oof = np.zeros(len(y), dtype=np.float64)
     importances = np.zeros(len(feat_cols), dtype=np.float64)
     models = []
     gkf = GroupKFold(n_splits=n_splits)
-    # Slice ROWS first (df.iloc[idx]), then select feat_cols and cast — not the other way
-    # round. `df[feat_cols].astype(np.float32)` on the FULL dataframe before any fold
-    # slicing crashed with MemoryError at full train scale (43.4M rows): selecting+casting
-    # every feature column at once needs a full-size temporary array, and LightGBM doesn't
-    # actually need a pre-cast float32 matrix at all — it converts internally on Dataset
-    # construction. Casting per-fold-slice (a train slice is ~80% of the data, still large,
-    # but this avoids ever holding a *whole extra* full-dataset-sized copy at once).
-    for fold, (tr_idx, va_idx) in enumerate(gkf.split(df, y, groups)):
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_all, y, groups)):
         log(f"Fold {fold + 1}/{n_splits}: train={len(tr_idx):,} val={len(va_idx):,} "
             f"(val positives={y[va_idx].sum():,})")
-        X_tr = df.iloc[tr_idx][feat_cols].astype(np.float32)
-        X_va = df.iloc[va_idx][feat_cols].astype(np.float32)
+        X_tr = X_all.iloc[tr_idx].astype(np.float32)
+        X_va = X_all.iloc[va_idx].astype(np.float32)
         train_set = lgb.Dataset(X_tr, label=y[tr_idx])
         val_set = lgb.Dataset(X_va, label=y[va_idx], reference=train_set)
         params = dict(LGB_PARAMS, seed=seed + fold)
