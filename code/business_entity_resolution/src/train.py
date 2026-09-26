@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -47,12 +48,20 @@ def log(msg: str) -> None:
 
 
 def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 0) -> tuple:
+    """Returns (oof, importances, models) — `models` is the list of per-fold LightGBM
+    boosters. These are what decide.py needs for inference on test data: OOF predictions
+    alone (what this function used to return) are only useful for evaluating train, since
+    every train pair already has a fold assignment. Test pairs have none, so predicting on
+    them means calling .predict() on saved models directly, averaged across folds (a
+    standard bagging ensemble — every fold's model saw ~80% of train, none of it saw any
+    test data, so there's no leakage risk in using all 5)."""
     X = df[feat_cols].astype(np.float32)
     y = df["label"].to_numpy()
     groups = df["source1_entity_id"].to_numpy()
 
     oof = np.zeros(len(df), dtype=np.float64)
     importances = np.zeros(len(feat_cols), dtype=np.float64)
+    models = []
     gkf = GroupKFold(n_splits=n_splits)
     for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y, groups)):
         log(f"Fold {fold + 1}/{n_splits}: train={len(tr_idx):,} val={len(va_idx):,} "
@@ -67,7 +76,17 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
         )
         oof[va_idx] = model.predict(X.iloc[va_idx], num_iteration=model.best_iteration)
         importances += model.feature_importance(importance_type="gain")
-    return oof, importances / n_splits
+        models.append(model)
+    return oof, importances / n_splits, models
+
+
+def save_models(models: list, feat_cols: list, best_threshold: float, model_dir: Path) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    for i, model in enumerate(models):
+        model.save_model(str(model_dir / f"fold_{i}.txt"), num_iteration=model.best_iteration)
+    meta = {"feature_cols": feat_cols, "best_threshold": best_threshold, "n_folds": len(models)}
+    (model_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    log(f"Saved {len(models)} fold models + meta.json to {model_dir}")
 
 
 def apply_exclusivity(df: pd.DataFrame, prob_col: str = "oof_prob") -> pd.DataFrame:
@@ -106,6 +125,7 @@ def main() -> None:
     ap.add_argument("--features", required=True)
     ap.add_argument("--gt", required=True)
     ap.add_argument("--out-oof", required=True)
+    ap.add_argument("--model-dir", default=None, help="Where to save fold models + meta.json for decide.py.")
     ap.add_argument("--folds", type=int, default=5)
     args = ap.parse_args()
 
@@ -115,7 +135,7 @@ def main() -> None:
     log(f"Loaded {len(df):,} pairs, {len(feat_cols)} features, {df['label'].sum():,} positives "
         f"({df['label'].mean():.2%})")
 
-    oof, importances = train_oof(df, feat_cols, n_splits=args.folds)
+    oof, importances, models = train_oof(df, feat_cols, n_splits=args.folds)
     df["oof_prob"] = oof
 
     imp = pd.Series(importances, index=feat_cols).sort_values(ascending=False)
@@ -142,6 +162,9 @@ def main() -> None:
     print(f"\nBest threshold: tau={best[0]:.2f} -> overall OOF macro F0.5 = {best[1]['overall']:.4f}")
     print(f"  (blocking-recall ceiling applies: this sample's blocking recall caps the "
           f"achievable score — see experiments.md)")
+
+    if args.model_dir:
+        save_models(models, feat_cols, float(best[0]), Path(args.model_dir))
 
     out_path = Path(args.out_oof)
     out_path.parent.mkdir(parents=True, exist_ok=True)
