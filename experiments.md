@@ -230,6 +230,40 @@ full file), giving ~8-10M pairs — comfortably within memory territory already 
 (the 50k sample's ~983k pairs trained without issue), while being a substantially larger and
 more representative training set than the original 50k-S1 development sample.
 
+## First complete, valid submission produced (26-27 Sep, overnight)
+
+Picked back up the pivot plan from the previous entry and ran it through to completion:
+
+1. **`sample_features.py`**: sampled 500,000 S1 entities (~9.8M pairs) from the full train
+   features — took ~12s (predicate pushdown, never touches the full 43.4M-row file).
+2. **Trained on the 500k sample**: OOF macro F0.5 = **0.6636** at τ=0.50 (consistent with the
+   50k sample's 0.6631, now on 10x the data). 5 fold models saved to `artifacts/models_full/`.
+3. **Full test-set blocking**: ran cleanly end to end this time (one transient crash on the
+   France→India transition, same known `explode()` memory-pressure pattern, fixed by a plain
+   retry — France's checkpoint was reused, no recomputation). Final numbers:
+   - France: 5,067,199 pairs (34m)
+   - India: 16,090,796 pairs (2h40m)
+   - US: 12,839,502 pairs (41m — faster than estimated)
+   - **Total: 33,997,497 candidate pairs, full coverage of all 1,732,544 test S1 entities**
+   - Total wall-clock: ~3h23m — close to the ~3.5-4h estimate, no sleep-inflation this run.
+4. **Test features**: 33,997,497 rows computed in ~10.5 min, no crash (all the batching/dtype
+   fixes from the train run held up at test scale too).
+5. **`decide.py`**: applied the 500k-sample model ensemble, enforced exclusivity, threshold
+   τ=0.50 (from training) → `output/matching_results.tsv` (1,732,544 rows: 1,271,476 with a
+   match, 461,068 predicted singletons) + `output/candidate_pairs.tsv` (copied through).
+6. **`utils/validate_submission.py --check-ids`: PASS.** Every ID in both files genuinely
+   exists in the test set; no format violations.
+
+**Honest read on the singleton rate**: 461,068/1,732,544 ≈ 26.6% predicted singletons, far
+above train's true ~5.6% singleton rate. This is expected given blocking recall (~56%) — many
+entities with real matches simply have no candidate clearing threshold, so the model defaults
+them to "no match." Not a bug, just the recall ceiling showing up directly in the submission;
+the private-leaderboard score will very likely reflect that ceiling until Day 2 embeddings
+improve recall.
+
+**Status: a complete, valid, submission-ready file exists at `output/matching_results.tsv` /
+`output/candidate_pairs.tsv`.** Uploading to the actual portal is the user's own action.
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
