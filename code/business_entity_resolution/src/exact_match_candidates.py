@@ -39,9 +39,29 @@ def _sorted_tokens_key(name_core: str) -> str:
     return " ".join(sorted(name_core.split()))
 
 
+# A trailing token that looks like it came from a scraped web listing / domain name, not part
+# of the actual business name -- seen repeatedly in exact-vs-squashed misses inspected via
+# diagnose_recall_misses.py (e.g. 'creativesystems com', 'romananimalhospital com').
+_DOMAIN_SUFFIXES = {"com", "in", "org", "net", "co", "biz", "info"}
+
+
+def _nospace_key(name_core: str) -> str:
+    """'roman animal hospital' vs 'romananimalhospital com', 'shalom network' vs
+    'shalomnetwork' -- one side has the name run together with no spaces (sometimes with a
+    trailing domain-like word tacked on), which breaks both exact-match (different string)
+    and sorted-token (one side is a single token, so sorting changes nothing). Squashing all
+    whitespace out of both sides, after dropping one trailing domain-suffix word if present,
+    directly targets this: real misses confirmed via diagnose_recall_misses.py on train."""
+    tokens = name_core.split()
+    if len(tokens) > 1 and tokens[-1] in _DOMAIN_SUFFIXES:
+        tokens = tokens[:-1]
+    return "".join(tokens)
+
+
 KEY_FNS = {
     "exact": lambda s: s,
     "sorted": _sorted_tokens_key,
+    "nospace": _nospace_key,
 }
 
 

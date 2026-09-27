@@ -58,6 +58,41 @@ def load_candidate_pairs(path: Path) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def load_candidate_pairs_from_sources(artifacts_dir: Path, split: str, extra_modes: list) -> pd.DataFrame:
+    """Alternative to load_candidate_pairs() for full-scale runs: builds the pairs frame
+    directly from blocking.py's candidate_scores_{split}.parquet plus each
+    {mode}_match_pairs_{split}.parquet (already flat, one row per pair), instead of writing a
+    comma-joined candidate_pairs.tsv and then exploding it back apart. That round-trip is pure
+    waste and, at merged4 scale (45.2M pairs), the explode()'s internal reindex/concat crashed
+    with an ArrayMemoryError -- a smaller-scale version of the exact same problem
+    exact_match_candidates.py's --measure-recall-gain already warns about and avoids (see its
+    docstring: 'NOT the candidate_pairs.tsv -- exploding that comma-joined TSV crashed')."""
+    parts = [pd.read_parquet(
+        artifacts_dir / f"candidate_scores_{split}.parquet",
+        columns=["source1_entity_id", "candidate_entity_id"],
+    )]
+    for mode in extra_modes:
+        path = artifacts_dir / f"{mode}_match_pairs_{split}.parquet"
+        if path.exists():
+            parts.append(pd.read_parquet(path))
+    combined = pd.concat(parts, ignore_index=True)
+    del parts
+    gc.collect()
+    # Dedup via integer-encoded keys, not drop_duplicates() on the raw string columns --
+    # confirmed at this exact row count (~60M) to sometimes thrash under memory pressure
+    # (paging, not a hard crash) badly enough to take 15+ minutes instead of under a minute.
+    # This mirrors the same fix already applied to blocking.py's measure_recall and to the
+    # nospace-pass recall measurement earlier in this project.
+    s1_codes, s1_uniques = pd.factorize(combined["source1_entity_id"])
+    cand_codes, cand_uniques = pd.factorize(combined["candidate_entity_id"])
+    n_cand = len(cand_uniques)
+    keys = s1_codes.astype(np.int64) * n_cand + cand_codes.astype(np.int64)
+    _, first_idx = np.unique(keys, return_index=True)
+    first_idx = np.sort(first_idx)
+    combined = combined.iloc[first_idx].reset_index(drop=True)
+    return combined
+
+
 def load_filtered(parquet_path: Path, ids: set) -> pd.DataFrame:
     """Load only FULL_COLS, filtered to `ids` via pyarrow predicate pushdown — filtering
     happens in pyarrow's C++ layer during the scan, so rows outside `ids` are never
@@ -248,16 +283,28 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="../../student_resource/dataset")
     ap.add_argument("--artifacts", default="../../artifacts")
-    ap.add_argument("--candidates", required=True, help="candidate_pairs.tsv from blocking.py")
+    ap.add_argument("--candidates", default=None, help="candidate_pairs.tsv from blocking.py "
+                     "(explode-based; fine at smaller scale, crashed at 45M+ pairs).")
+    ap.add_argument("--extra-modes", nargs="*", default=None,
+                     help="Build pairs directly from candidate_scores_{split}.parquet + these "
+                          "{mode}_match_pairs_{split}.parquet files instead of --candidates -- "
+                          "avoids the comma-join/explode round-trip entirely. Mutually "
+                          "exclusive with --candidates.")
     ap.add_argument("--split", choices=["train", "test"], default="train")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if (args.candidates is None) == (args.extra_modes is None):
+        raise SystemExit("Pass exactly one of --candidates or --extra-modes.")
 
     data_dir = Path(args.data)
     artifacts_dir = Path(args.artifacts)
 
-    log(f"Loading candidate pairs from {args.candidates}...")
-    pairs = load_candidate_pairs(Path(args.candidates))
+    if args.candidates is not None:
+        log(f"Loading candidate pairs from {args.candidates}...")
+        pairs = load_candidate_pairs(Path(args.candidates))
+    else:
+        log(f"Building candidate pairs directly from parquet sources (modes: {args.extra_modes})...")
+        pairs = load_candidate_pairs_from_sources(artifacts_dir, args.split, args.extra_modes)
     log(f"  {len(pairs):,} candidate pairs, {pairs['source1_entity_id'].nunique():,} S1 entities")
 
     s1_ids = set(pairs["source1_entity_id"])

@@ -31,10 +31,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifacts", default="../../artifacts")
     ap.add_argument("--split", choices=["train", "test"], default="train")
-    ap.add_argument("--extra-modes", nargs="*", default=["exact", "sorted"],
+    ap.add_argument("--extra-modes", nargs="*", default=["exact", "sorted", "nospace"],
                      help="Which {mode}_match_pairs_{split}.parquet files to union in, on top "
                           "of blocking.py's token/bigram candidates. Default: exact + sorted "
-                          "(word-order-independent, catches reordering).")
+                          "(word-order-independent, catches reordering) + nospace (catches "
+                          "squashed/no-space names, e.g. from scraped web listings).")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
