@@ -339,6 +339,26 @@ Regenerated test predictions: 1,732,544 rows, 446,070 predicted singletons (down
 uploaded (public LB currently only reflects the first submission, 0.658, from the baseline
 model before either supplementary pass).
 
+## Theoretical ceiling check + "more data" test (27 Sep)
+
+User asked whether something substantial could push the score above 0.8. Worked out the
+ceiling a theoretically *perfect* classifier could reach on our current candidates (59%
+blocking recall, 5.6% singleton rate): entities with matches get precision=1.0 (only true
+positives ever selected) and ~59% recall -> F0.5≈0.878 each; singletons get 1.0. Weighted
+average: **~0.885 ceiling**. We're at 0.684 — a large gap below that ceiling, meaning the
+bottleneck right now is **classifier/feature quality, not blocking recall**. The
+originally-planned "context/rank features" (candidate rank within its S1's shortlist,
+reverse-rank, score gap to the best candidate — flagged in the plan as "usually the strongest
+feature group") were never actually implemented in `features.py`. That's the concrete gap.
+
+**Tested "train on more data" as a lower-risk lever first** (500k -> 1M S1, ~20.3M rows,
+~38 min, no crash — confirms memmap-based training is reliable well past 500k, just not
+tested at the full 2.2M/43M-row scale that crashed originally). **Result: OOF F0.5 0.6840 ->
+0.6848 — only +0.0008, essentially noise.** Real, useful finding: data volume is NOT the
+bottleneck at the current feature set; the model was already data-sufficient at 500k. This
+sharpens the priority — rank/context features are the higher-payoff lever to pursue next, not
+further scaling the training sample.
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
