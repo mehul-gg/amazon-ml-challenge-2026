@@ -423,6 +423,64 @@ fifth submission candidate, OOF 0.6916, not yet uploaded. Running progression: 0
 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 (cumulative +0.0280, +4.2% relative over the original
 baseline).
 
+## Squashed-name (nospace) blocking pass (27 Sep) — biggest single recall gain so far
+
+Rather than guess at the next fix, wrote `diagnose_recall_misses.py`: samples real
+ground-truth pairs the current candidate set (blocking + exact + sorted) still misses, with
+actual name/address text side by side, using the same integer-encoded comparison pattern as
+`measure_recall`. 40 real misses inspected fell into a few clear buckets: (1) one side's name
+run together with no spaces, sometimes with a trailing domain-like word — 'creative systems'
+vs 'creativesystems com', 'shalom network' vs 'shalomnetwork', 'roman animal hospital' vs
+'romananimalhospital com' — distinct from reordering since one side is a single token and
+sorting it changes nothing; (2) Devanagari/Bengali/Kannada transliteration (genuinely hard
+without embeddings); (3) real typos (needs fuzzy/edit-distance blocking, not exact-key); (4)
+a handful of literally-identical names ('northwind', 'viis', 'family specialists') apparently
+still dropped by the exact-match pass's `max_group_size=50` genericity cap — a separate,
+not-yet-investigated issue.
+
+Targeted bucket (1): added a `nospace` key_mode to `exact_match_candidates.py` — squashes all
+whitespace out of `name_core` after dropping one trailing domain-suffix word (com/in/org/net/
+co/biz/info) if present, same country-scoped/capped structure as exact/sorted. **Measured
+recall gain: 59.02% -> 61.47%, +2.45pp** — the biggest single supplementary-pass gain so far,
+bigger than exact (+1.65pp) and sorted (+1.27pp) individually.
+
+Hit a real memory bug measuring this: the first gain-measurement script did `pd.concat` +
+`drop_duplicates()` on ~62M raw string-ID rows across 4 parquet files and thrashed for 10+
+minutes under low free-virtual-memory (same class of problem as several earlier crashes in
+this project) before being killed and rewritten with integer-encoded factorization — finished
+in under 4 minutes once fixed. Applied the same lesson when regenerating features: reused
+`features.py`'s existing `load_candidate_pairs()` (explodes the comma-joined
+candidate_pairs.tsv) crashed outright with `ArrayMemoryError` at the new 45.2M-pair merged
+scale — added `load_candidate_pairs_from_sources()` (new `--extra-modes` CLI arg) which builds
+the pairs frame directly from the flat per-mode parquets instead, deduping via integer keys
+instead of `drop_duplicates()` on strings. Full recompute went cleanly after that fix:
+- `features_train_merged4.parquet`: 45,185,457 rows, 4,695,401 positives (10.39%) — matches
+  the 61.47% recall measurement exactly. ~15 min full-scale (train candidate pairs 45.2M).
+- `features_test_merged4.parquet`: regenerating next (candidate pairs 35,475,094).
+
+Ran `add_rank_features.py` on both full-scale merged4 files -> `features_{split}_merged5.parquet`
+(train: 45,185,457 rows; test: 35,475,094 rows), resampled 500k S1 from train, retrained with
+the same tuned hyperparameters (num_leaves=63, min_data_in_leaf=30, learning_rate=0.04).
+
+**Result: OOF macro F0.5 0.6916 -> 0.7059 (+0.0143, tau=0.60)** — the biggest single gain of
+the night, confirming the +2.45pp recall improvement from the nospace pass translated directly
+into classifier quality, not just more (mostly-negative) candidates for the model to reject.
+First time crossing 0.70. Regenerated and validated test predictions
+(`utils/validate_submission.py --check-ids`: PASS) — 1,297,775 / 1,732,544 test entities
+predicted with at least one match, 434,769 singletons. Sent to the user as the current best
+submission candidate; not yet uploaded to the leaderboard.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> **0.7059**
+(baseline -> exact-match -> sorted-token -> rank/context -> hyperparameter tuning -> nospace).
+Cumulative +0.0423 (+6.4% relative) over the first real submission. Blocking recall over the
+same progression: 56.10% -> 57.75% -> 59.02% -> (unchanged) -> (unchanged) -> 61.47%.
+
+**Negative/neutral results from the same session, for completeness:** training on 2x the data
+(500k->1M S1) gave only +0.0008 (not the bottleneck); the still-unexplained `max_group_size=50`
+genericity-cap drops on literally-identical names (northwind, viis, family specialists — see
+the nospace-pass entry above) remain unfixed, a candidate for a future session.
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
