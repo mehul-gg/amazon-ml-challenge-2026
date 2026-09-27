@@ -359,6 +359,47 @@ bottleneck at the current feature set; the model was already data-sufficient at 
 sharpens the priority — rank/context features are the higher-payoff lever to pursue next, not
 further scaling the training sample.
 
+## Rank/context features added (27 Sep) — the previously-planned, never-built feature group
+
+Implemented `add_rank_features.py`: a post-process pass over an existing features parquet
+(rather than rebuilding features.py from scratch) that adds 7 new columns per (S1, candidate)
+pair, using a cheap heuristic proxy score (0.7×name_token_set + 0.3×addr_token_set, falling
+back to name-only when either address is empty) purely to rank candidates — the raw
+similarity features remain available separately for the model:
+- `f_rank_in_s1` / `f_reverse_rank_in_s1` / `f_group_size_s1` / `f_score_gap_to_best_in_s1`:
+  this candidate's rank (and gap to the best) among all candidates competing for the same S1.
+- `f_rank_for_cand` / `f_group_size_cand` / `f_score_gap_to_best_for_cand`: the reverse
+  direction — this S1's rank (and gap to the best) among all S1s competing for the same
+  candidate. Directly relevant to the exclusivity rule (each candidate goes to only one S1).
+
+Implementation note: computing this needs a global groupby/rank over the whole candidate set,
+which doesn't fit features.py's per-batch streaming design. Kept memory bounded by
+factorizing the two ID columns to int32 codes and dropping the raw strings immediately (each
+one costs several GB at 35-45M rows otherwise — the same pattern that caused MemoryErrors
+earlier in this project), doing the actual rank computation with numpy (bincount +
+searchsorted for group boundaries, one lexsort) instead of pandas groupby, and streaming the
+final rewrite back onto the original file via `pyarrow.iter_batches` + `ParquetWriter`. Ran in
+under 2 minutes at full scale on both splits (train: 44,734,891 rows / 2,206,776 S1s; test:
+35,162,542 rows / 1,732,492 S1s) — negligible cost next to the hours blocking.py and
+features.py took.
+
+**Result on the same 500k-S1 sample used for the 0.6840 baseline: OOF F0.5 0.6840 -> 0.6903
+(+0.0063, tau=0.60).** A real, meaningful gain — about 8x the +0.0008 the 1M-data test gave,
+though still smaller than the two blocking-fix passes (+0.0126, +0.0078). LightGBM's split-gain
+importances confirm the new features carry real signal: `f_score_gap_to_best_for_cand` ranks
+**3rd overall** by total gain (6.33e8, behind only f_name_len_a and f_name_ratio), and
+`f_rank_for_cand` ranks 7th (1.57e8). Notably the **reverse-direction** (per-candidate) rank
+features dominate — the forward-direction (per-S1) ones (`f_rank_in_s1`,
+`f_reverse_rank_in_s1`, `f_group_size_s1`, `f_score_gap_to_best_in_s1`) rank much lower
+(roughly 590k-7.9M gain, near the bottom of the 28-feature list). Plausible reason: exclusivity
+is enforced downstream in decide.py regardless, so what the model most needs from the rank
+features is "is some OTHER S1 a stronger claimant for this same candidate?" — exactly what the
+per-candidate features encode — rather than its own S1's shortlist shape.
+
+Progression so far, same metric, comparable sample size: 0.6636 -> 0.6762 -> 0.6840 -> 0.6903
+(baseline -> exact-match -> sorted-token -> rank/context), a cumulative +0.0267 (+4.0%
+relative). Regenerating test predictions with the merged3 model + merged2 test candidates next.
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
