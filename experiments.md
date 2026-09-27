@@ -546,6 +546,52 @@ address-exact). Cumulative +0.0865 (+13.0% relative) over the first real submiss
 recall over the same progression: 56.10% -> 57.75% -> 59.02% -> (unchanged) -> (unchanged) ->
 61.47% -> **65.72%**.
 
+## Address normalization fix (state abbreviations + leading zeros): +4.27pp more (27 Sep)
+
+Re-ran `diagnose_recall_misses.py` on the new (post address-exact-pass) candidate set to find
+the next target. Two dominant, clearly fixable patterns emerged from 40 fresh misses:
+1. **State name vs. abbreviation mismatch** — ~15/40 examples differ from their true match
+   ONLY in this: `'uttar pradesh'` vs `'up'`, `'west bengal'` vs `'wb'`, `'haryana'` vs `'hr'`,
+   `'california'` vs `'ca'`, etc. Otherwise byte-identical addresses that the exact-match pass
+   currently treats as different strings.
+2. **Leading zeros on house/street numbers** — `'1297 lynwood drive...'` vs
+   `'001297 lynwood drive...'`.
+
+Both are normalization gaps, not blocking-strategy gaps — fixing them in `normalize_address`
+lets the *existing* address-exact pass catch far more for free, no new key_mode needed. Added
+to `normalize.py`: a one-directional (full-name -> abbreviation only, never the reverse, which
+would be ambiguous — "or" is Oregon in a US address but Odisha in an Indian one) state-name
+canonicalization dict covering all US states + major Indian states (hand-written domain rule,
+not an external lookup, per CLAUDE.md's fair-play rules), applied as a phrase-level regex
+substitution; and a leading-zero strip restricted to the START of the address string only
+(so a genuine postal code elsewhere in the string, which can legitimately start with 0, e.g.
+some Massachusetts ZIPs, is never touched). Smoke-tested against the actual 4 examples from
+the miss sample — all 4 became byte-identical after the fix.
+
+Re-normalized all 6 `norm_{train,test}_source{1,2,3}.parquet` files (confirmed this doesn't
+touch `blocking.py`'s inputs — it only reads `name_core`/`postal_code`, both untouched by this
+fix — so the expensive multi-hour blocking pass does NOT need to be redone, only the
+address-exact pass and everything downstream of it). Re-ran the address-exact pass on train:
+pair count nearly doubled, 1,137,922 -> 2,208,396.
+
+**Measured recall: 65.72% -> 69.99%, +4.27pp** — essentially matching the original
+address-exact pass's own gain, from a pure normalization fix on top of it. Confirms address
+was even more informative than the first measurement suggested; the state-abbreviation noise
+alone was masking a large share of otherwise-clean address matches, especially for India (47%
+of test) where the state-abbreviation pattern is common.
+
+Also hit and fixed a genuine bug in `diagnose_recall_misses.py` while re-running it: its
+`np.isin()` call was still crashing with `MemoryError` even after switching `have_key_sorted`'s
+computation to sort-based dedup, because `np.isin()` unconditionally calls `np.unique()`
+*internally* on its second argument unless told not to — pre-deduping the input doesn't skip
+that internal call by itself. Fixed by passing `assume_unique=True` (valid here since both
+arguments actually are unique/sortable candidate-pair keys). Worth remembering: sort-based
+dedup alone doesn't fully replace `np.unique()`-avoidance in `np.isin()` calls — need
+`assume_unique=True` too.
+
+Continuing the full recompute (merge -> merged8, features -> merged8/9, rank features,
+resample, retrain) to measure the real training impact.
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test

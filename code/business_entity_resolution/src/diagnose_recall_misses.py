@@ -50,7 +50,7 @@ def main() -> None:
         columns=["source1_entity_id", "candidate_entity_id"],
     )
     parts = [existing]
-    for mode in ("exact", "sorted"):
+    for mode in ("exact", "sorted", "nospace", "address_clean_exact"):
         p = artifacts_dir / f"{mode}_match_pairs_train.parquet"
         if p.exists():
             parts.append(pd.read_parquet(p))
@@ -66,8 +66,18 @@ def main() -> None:
     n_have = len(existing_pairs)
     have_key = s1_codes[:n_have].astype(np.int64) * n_cand + cand_codes[:n_have].astype(np.int64)
     gt_key = s1_codes[n_have:].astype(np.int64) * n_cand + cand_codes[n_have:].astype(np.int64)
-    have_key_sorted = np.sort(np.unique(have_key))
-    is_hit = np.isin(gt_key, have_key_sorted)
+    # Sort-based dedup, not np.unique() -- its hash-table path has repeatedly hit
+    # MemoryError/ArrayMemoryError this session at 50-70M-element scale despite several GB
+    # free RAM (fragmentation, not a hard limit). Sort+diff is more predictable here.
+    have_key.sort()
+    keep = np.empty(len(have_key), dtype=bool)
+    keep[0] = True
+    np.not_equal(have_key[1:], have_key[:-1], out=keep[1:])
+    have_key_sorted = have_key[keep]
+    # assume_unique=True: have_key_sorted is already sorted+deduped above, so this skips
+    # np.isin()'s own internal np.unique() call on it -- that internal call is exactly what
+    # kept crashing with MemoryError even after we'd already deduped have_key ourselves.
+    is_hit = np.isin(gt_key, have_key_sorted, assume_unique=True)
     n_hit = int(is_hit.sum())
     log(f"  Recall: {n_hit:,} / {n_true:,} = {n_hit / n_true:.4%}")
 

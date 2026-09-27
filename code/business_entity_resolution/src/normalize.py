@@ -66,6 +66,48 @@ _ADDR_ABBREV_PATTERN = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in ADDRESS_ABBREV) + r")\b"
 )
 
+# State/administrative-division full name -> abbreviation, one direction only (never expand an
+# abbreviation back to a full name, which would be ambiguous -- "or" is Oregon in a US address
+# and Odisha in an Indian one, but country-scoped blocking means that ambiguity never matters
+# for collapsing full names down). Confirmed via diagnose_recall_misses.py: a large share of
+# real misses (~15/40 in one sample) differ from their true match ONLY in this -- e.g.
+# 'uttar pradesh' vs 'up', 'west bengal' vs 'wb', 'california' vs 'ca' -- otherwise-identical
+# addresses that an exact-match blocking pass currently treats as different strings.
+US_STATE_ABBREV = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca",
+    "colorado": "co", "connecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga",
+    "hawaii": "hi", "idaho": "id", "illinois": "il", "indiana": "in", "iowa": "ia",
+    "kansas": "ks", "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm", "new york": "ny",
+    "north carolina": "nc", "north dakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhode island": "ri", "south carolina": "sc",
+    "south dakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut", "vermont": "vt",
+    "virginia": "va", "washington": "wa", "west virginia": "wv", "wisconsin": "wi",
+    "wyoming": "wy",
+}
+INDIA_STATE_ABBREV = {
+    "andhra pradesh": "ap", "arunachal pradesh": "ar", "assam": "as", "bihar": "br",
+    "chhattisgarh": "cg", "goa": "ga", "gujarat": "gj", "haryana": "hr",
+    "himachal pradesh": "hp", "jharkhand": "jh", "karnataka": "ka", "kerala": "kl",
+    "madhya pradesh": "mp", "maharashtra": "mh", "manipur": "mn", "meghalaya": "ml",
+    "mizoram": "mz", "nagaland": "nl", "odisha": "or", "punjab": "pb", "rajasthan": "rj",
+    "sikkim": "sk", "tamil nadu": "tn", "telangana": "tg", "tripura": "tr",
+    "uttar pradesh": "up", "uttarakhand": "uk", "west bengal": "wb", "delhi": "dl",
+}
+STATE_ABBREV = {**US_STATE_ABBREV, **INDIA_STATE_ABBREV}
+# Longest phrase first so "west bengal" matches before any shorter overlapping alternative.
+_STATE_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(STATE_ABBREV, key=len, reverse=True)) + r")\b"
+)
+
+# A leading, zero-padded house/unit number ('001297 lynwood drive' vs '1297 lynwood drive') --
+# restricted to the START of the string specifically (real postal codes, which legitimately
+# can start with 0, e.g. Massachusetts ZIPs, normally appear later in the string, not as the
+# very first token) so this never touches a genuine postal code elsewhere in the address.
+_LEADING_ZERO_HOUSE_PATTERN = re.compile(r"^0+(\d+)\b")
+
 # Placeholder / junk tokens seen in real data (e.g. literal "<NULL>" inline in
 # an address — see experiments.md sample matches) — stripped, not treated as content.
 PLACEHOLDER_PATTERN = re.compile(
@@ -177,6 +219,8 @@ def normalize_address(raw: str) -> dict:
 
     clean = basic_clean(raw)
     clean = _ADDR_ABBREV_PATTERN.sub(lambda m: ADDRESS_ABBREV[m.group(1)], clean)
+    clean = _STATE_PATTERN.sub(lambda m: STATE_ABBREV[m.group(1)], clean)
+    clean = _LEADING_ZERO_HOUSE_PATTERN.sub(lambda m: m.group(1), clean, count=1)
     clean = _WS_PATTERN.sub(" ", clean).strip()
     return {
         "address_clean": clean,
