@@ -1,12 +1,15 @@
-"""Merge blocking.py's token/bigram candidates with exact_match_candidates.py's exact-name
-candidates into one candidate_pairs.tsv, in the exact required submission format.
+"""Merge blocking.py's token/bigram candidates with any number of
+exact_match_candidates.py supplementary passes (exact-name, sorted-token/reorder, ...) into
+one candidate_pairs.tsv, in the exact required submission format.
 
-Works entirely from flat parquet sources (candidate_scores_{split}.parquet and
-exact_match_pairs_{split}.parquet) — never re-explodes the comma-joined TSV, which crashed
-with MemoryError at full scale more than once during this project (see experiments.md).
+Works entirely from flat parquet sources (candidate_scores_{split}.parquet plus whichever
+{mode}_match_pairs_{split}.parquet files exist) — never re-explodes the comma-joined TSV,
+which crashed with MemoryError at full scale more than once during this project (see
+experiments.md).
 
 Usage:
   python src/merge_candidates.py --artifacts ../../artifacts --split train \
+      --extra-modes exact sorted \
       --out ../../artifacts/candidate_pairs_train_merged.tsv
 """
 from __future__ import annotations
@@ -28,6 +31,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifacts", default="../../artifacts")
     ap.add_argument("--split", choices=["train", "test"], default="train")
+    ap.add_argument("--extra-modes", nargs="*", default=["exact", "sorted"],
+                     help="Which {mode}_match_pairs_{split}.parquet files to union in, on top "
+                          "of blocking.py's token/bigram candidates. Default: exact + sorted "
+                          "(word-order-independent, catches reordering).")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -40,12 +47,15 @@ def main() -> None:
     )
     log(f"  {len(existing):,} pairs")
 
-    log("Loading exact-match candidates...")
-    exact = pd.read_parquet(artifacts_dir / f"exact_match_pairs_{args.split}.parquet")
-    log(f"  {len(exact):,} pairs")
+    parts = [existing]
+    for mode in args.extra_modes:
+        path = artifacts_dir / f"{mode}_match_pairs_{args.split}.parquet"
+        extra = pd.read_parquet(path)
+        log(f"  +{mode}: {len(extra):,} pairs ({path.name})")
+        parts.append(extra)
 
-    combined = pd.concat([existing, exact], ignore_index=True).drop_duplicates()
-    del existing, exact
+    combined = pd.concat(parts, ignore_index=True).drop_duplicates()
+    del parts, existing
     log(f"  {len(combined):,} combined unique pairs")
 
     log("Loading full S1 scope...")

@@ -308,6 +308,37 @@ Regenerated test predictions (`decide.py` with the new model + merged test candi
 from 1,271,476). **`utils/validate_submission.py --check-ids`: PASS.** New
 `output/matching_results.tsv` is ready — a second, improved submission, not yet uploaded.
 
+## Sorted-token (reorder-tolerant) supplementary pass — a second cheap win (27 Sep)
+
+User asked to keep improving before uploading again. Generalized `exact_match_candidates.py`
+to accept a `--key-mode`: `exact` (raw core name, already built) or `sorted` (name_core with
+its words alphabetically sorted — "orthopedic safe health" and "orthopedic health safe" both
+become "health orthopedic safe"). This directly targets the word-reordering recall-miss
+category identified earlier: adjacent-word bigrams have zero overlap when word order differs,
+even if every word matches. Same vectorized per-country merge + `max_group_size=50` cap as the
+exact-match pass, no new engineering risk.
+
+- Train: France n/a, India 1.80M, US 4.60M -> **6.40M sorted-match pairs**
+- Test: France 1.32M, India 1.69M, US 2.19M -> **5.20M sorted-match pairs**
+
+**Measured incremental recall gain on train**: bigram-only 56.10% -> +exact 57.75% ->
+**+sorted 59.02%** (+1.27pp on top of exact-match, +2.92pp total over baseline). Confirms the
+reordering hypothesis was real, not a one-off from the 20-case sample.
+
+Generalized `merge_candidates.py` to take a `--extra-modes` list (default `exact sorted`)
+instead of hardcoding two sources, so adding a third pass didn't require new merge logic.
+
+**Retrained on a fresh 500k-S1 sample of the triple-merged candidates: OOF macro F0.5 = 0.6840
+at τ=0.55** — up from 0.6762 (exact-match only) and 0.6636 (baseline). Total progression:
+**0.6636 -> 0.6762 -> 0.6840**, a genuine +3.1% relative improvement, entirely from cheap
+(minutes-scale) supplementary blocking passes — no multi-hour embedding compute needed.
+
+Regenerated test predictions: 1,732,544 rows, 446,070 predicted singletons (down again from
+451,981), 1,286,474 with a match. **`utils/validate_submission.py --check-ids`: PASS.**
+`output/matching_results.tsv` now holds this third, further-improved version — not yet
+uploaded (public LB currently only reflects the first submission, 0.658, from the baseline
+model before either supplementary pass).
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test

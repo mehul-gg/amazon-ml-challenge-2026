@@ -31,21 +31,39 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def compute_exact_match_pairs(artifacts_dir: Path, split: str, max_group_size: int = 50) -> pd.DataFrame:
-    """Returns columns [source1_entity_id, candidate_entity_id] — every (S1, candidate) pair
-    sharing an exact, non-empty (country, name_core). Vectorized merge per country, not a
-    Python loop over groups — the earlier version's `groupby(...)` + per-group Python loop
-    would have repeated the exact slow-loop-over-millions-of-rows pattern that caused
-    problems throughout blocking.py's development.
+def _sorted_tokens_key(name_core: str) -> str:
+    """'orthopedic health safe' and 'orthopedic safe health' both become the same key —
+    catches pure word-reordering, which breaks blocking.py's adjacent-word bigram overlap
+    entirely (zero shared bigrams) even though every word matches. Real case confirmed from
+    train ground truth: 'orthopedic safe health' vs 'orthopedic health safe'."""
+    return " ".join(sorted(name_core.split()))
 
-    `max_group_size` caps how many total records (S1+candidates) may share one exact name
-    before that name is dropped from this pass entirely — a first, uncapped run on train
-    produced 75.2M pairs (nearly double the entire properly-blocked candidate set of 43.4M)
-    from just 1.97M S1 entities. The per-S1 group-size distribution showed why: median 4
-    (genuine near-duplicates, e.g. "krishna power"), but a max of 1,359 — a handful of very
-    generic names (short/common words surviving normalization) were dominating the total.
-    Capping mirrors blocking.py's max_df concept, just applied to whole-name groups instead
-    of individual tokens."""
+
+KEY_FNS = {
+    "exact": lambda s: s,
+    "sorted": _sorted_tokens_key,
+}
+
+
+def compute_exact_match_pairs(
+    artifacts_dir: Path, split: str, max_group_size: int = 50, key_mode: str = "exact"
+) -> pd.DataFrame:
+    """Returns columns [source1_entity_id, candidate_entity_id] — every (S1, candidate) pair
+    sharing an exact key derived from name_core (see KEY_FNS: "exact" = the raw core name,
+    "sorted" = word-order-independent). Vectorized merge per country, not a Python loop over
+    groups — the earlier version's `groupby(...)` + per-group Python loop would have repeated
+    the exact slow-loop-over-millions-of-rows pattern that caused problems throughout
+    blocking.py's development.
+
+    `max_group_size` caps how many total records (S1+candidates) may share one key before
+    it's dropped from this pass entirely — a first, uncapped "exact" run on train produced
+    75.2M pairs (nearly double the entire properly-blocked candidate set of 43.4M) from just
+    1.97M S1 entities. The per-S1 group-size distribution showed why: median 4 (genuine
+    near-duplicates, e.g. "krishna power"), but a max of 1,359 — a handful of very generic
+    names (short/common words surviving normalization) were dominating the total. Capping
+    mirrors blocking.py's max_df concept, just applied to whole-name (or sorted-token) groups
+    instead of individual tokens."""
+    key_fn = KEY_FNS[key_mode]
     cols = ["entity_id", "country", "name_core"]
     s1_full = pd.read_parquet(artifacts_dir / f"norm_{split}_source1.parquet", columns=cols)
     s2_full = pd.read_parquet(artifacts_dir / f"norm_{split}_source2.parquet", columns=cols)
@@ -54,26 +72,28 @@ def compute_exact_match_pairs(artifacts_dir: Path, split: str, max_group_size: i
     del s2_full, s3_full
     s1_full = s1_full[s1_full["name_core"] != ""]
     cand_full = cand_full[cand_full["name_core"] != ""]
+    s1_full = s1_full.assign(key=s1_full["name_core"].map(key_fn))
+    cand_full = cand_full.assign(key=cand_full["name_core"].map(key_fn))
 
     results = []
     countries = sorted(set(s1_full["country"]) & set(cand_full["country"]))
     for country in countries:
         t0 = time.time()
-        s1_c = s1_full[s1_full["country"] == country][["entity_id", "name_core"]]
-        cand_c = cand_full[cand_full["country"] == country][["entity_id", "name_core"]]
+        s1_c = s1_full[s1_full["country"] == country][["entity_id", "key"]]
+        cand_c = cand_full[cand_full["country"] == country][["entity_id", "key"]]
 
-        # Drop over-generic names BEFORE the merge: count total (S1+candidate) occurrences
-        # per name_core in this country, exclude any name over the cap. Cheap (value_counts
-        # on two already-small, country-scoped columns), and keeps the merge itself small.
-        name_counts = pd.concat([s1_c["name_core"], cand_c["name_core"]]).value_counts()
-        ok_names = name_counts[name_counts <= max_group_size].index
-        s1_c = s1_c[s1_c["name_core"].isin(ok_names)]
-        cand_c = cand_c[cand_c["name_core"].isin(ok_names)]
+        # Drop over-generic keys BEFORE the merge: count total (S1+candidate) occurrences per
+        # key in this country, exclude any key over the cap. Cheap (value_counts on two
+        # already-small, country-scoped columns), and keeps the merge itself small.
+        key_counts = pd.concat([s1_c["key"], cand_c["key"]]).value_counts()
+        ok_keys = key_counts[key_counts <= max_group_size].index
+        s1_c = s1_c[s1_c["key"].isin(ok_keys)]
+        cand_c = cand_c[cand_c["key"].isin(ok_keys)]
 
-        merged = s1_c.merge(cand_c, on="name_core", suffixes=("_s1", "_cand"))
+        merged = s1_c.merge(cand_c, on="key", suffixes=("_s1", "_cand"))
         merged = merged.rename(columns={"entity_id_s1": "source1_entity_id", "entity_id_cand": "candidate_entity_id"})
-        log(f"  Country={country}: {len(merged):,} exact-match pairs in {time.time()-t0:.1f}s "
-            f"(after dropping names shared by >{max_group_size} records)")
+        log(f"  Country={country}: {len(merged):,} {key_mode}-match pairs in {time.time()-t0:.1f}s "
+            f"(after dropping keys shared by >{max_group_size} records)")
         results.append(merged[["source1_entity_id", "candidate_entity_id"]])
 
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame(
@@ -86,6 +106,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifacts", default="../../artifacts")
     ap.add_argument("--split", choices=["train", "test"], default="train")
+    ap.add_argument("--key-mode", choices=list(KEY_FNS), default="exact",
+                     help="'exact' = raw core name; 'sorted' = word-order-independent "
+                          "(catches pure reordering, e.g. 'a b c' matches 'c a b').")
+    ap.add_argument("--max-group-size", type=int, default=50)
     ap.add_argument("--out", default=None)
     ap.add_argument("--measure-recall-gain", action="store_true",
                      help="Train only: report how much this ADDS to existing blocking recall.")
@@ -98,10 +122,10 @@ def main() -> None:
     args = ap.parse_args()
 
     artifacts_dir = Path(args.artifacts)
-    log(f"Computing exact-match candidates for {args.split}...")
-    pairs = compute_exact_match_pairs(artifacts_dir, args.split)
+    log(f"Computing {args.key_mode}-match candidates for {args.split}...")
+    pairs = compute_exact_match_pairs(artifacts_dir, args.split, args.max_group_size, args.key_mode)
 
-    out_path = Path(args.out) if args.out else artifacts_dir / f"exact_match_pairs_{args.split}.parquet"
+    out_path = Path(args.out) if args.out else artifacts_dir / f"{args.key_mode}_match_pairs_{args.split}.parquet"
     pairs.to_parquet(out_path, index=False)
     log(f"Wrote {len(pairs):,} exact-match pairs to {out_path}")
 
