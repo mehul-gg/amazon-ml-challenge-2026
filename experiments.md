@@ -398,7 +398,30 @@ per-candidate features encode — rather than its own S1's shortlist shape.
 
 Progression so far, same metric, comparable sample size: 0.6636 -> 0.6762 -> 0.6840 -> 0.6903
 (baseline -> exact-match -> sorted-token -> rank/context), a cumulative +0.0267 (+4.0%
-relative). Regenerating test predictions with the merged3 model + merged2 test candidates next.
+relative). Regenerated and validated test predictions with the merged3 model (models_merged3_500k)
++ merged2 test candidates — `utils/validate_submission.py --check-ids` PASSes. Ready as a
+fourth submission candidate; not yet uploaded.
+
+## LightGBM hyperparameter tuning (27 Sep)
+
+Added CLI overrides to `train.py` (`--num-leaves`, `--learning-rate`, `--min-data-in-leaf`,
+`--num-boost-round`, `--early-stopping-rounds`) instead of hardcoding a new script — the
+existing LGB_PARAMS (num_leaves=31, min_data_in_leaf=50, learning_rate=0.05) had never been
+tuned. Reasoning for the first variant tried: 500k S1 -> ~10.1M rows is a lot of data for
+31-leaf trees to only lightly use; tried num_leaves=63, min_data_in_leaf=30 (loosened to let
+the bigger trees actually split that far), learning_rate=0.04 (slightly lower to compensate
+for the higher-variance deeper trees, with early stopping already in place to control rounds).
+
+**Result: OOF F0.5 0.6903 -> 0.6916 (+0.0013)** on the same rank-features 500k sample. Small
+but real and in the expected direction. Diminishing-returns pattern similar to the 1M-data
+test, suggesting hyperparameters were already reasonably close to good for this feature set —
+unlike the rank/context features, which added genuinely new information, tuning here is
+squeezing marginal gains out of information the model already had access to.
+
+Regenerated and validated test predictions using this tuned model (models_merged3_tuned1) —
+fifth submission candidate, OOF 0.6916, not yet uploaded. Running progression: 0.6636 ->
+0.6762 -> 0.6840 -> 0.6903 -> 0.6916 (cumulative +0.0280, +4.2% relative over the original
+baseline).
 
 ## decide.py added + train.py now persists models (26 Sep)
 

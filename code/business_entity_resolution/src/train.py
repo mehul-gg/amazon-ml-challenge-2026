@@ -76,7 +76,8 @@ def log(msg: str) -> None:
 
 
 def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 0,
-              memmap_dir: Path | None = None) -> tuple:
+              memmap_dir: Path | None = None, lgb_params: dict | None = None,
+              num_boost_round: int = 500, early_stopping_rounds: int = 30) -> tuple:
     """Returns (oof, importances, models) — `models` is the list of per-fold LightGBM
     boosters. These are what decide.py needs for inference on test data: OOF predictions
     alone (what this function used to return) are only useful for evaluating train, since
@@ -141,11 +142,11 @@ def train_oof(df: pd.DataFrame, feat_cols: list, n_splits: int = 5, seed: int = 
         X_va = X_all[va_idx]
         train_set = lgb.Dataset(X_tr, label=y[tr_idx], feature_name=feat_cols)
         val_set = lgb.Dataset(X_va, label=y[va_idx], reference=train_set, feature_name=feat_cols)
-        params = dict(LGB_PARAMS, seed=seed + fold)
+        params = dict(lgb_params if lgb_params is not None else LGB_PARAMS, seed=seed + fold)
         model = lgb.train(
-            params, train_set, num_boost_round=500,
+            params, train_set, num_boost_round=num_boost_round,
             valid_sets=[val_set],
-            callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)],
+            callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False), lgb.log_evaluation(0)],
         )
         oof[va_idx] = model.predict(X_va, num_iteration=model.best_iteration)
         importances += model.feature_importance(importance_type="gain")
@@ -205,8 +206,23 @@ def main() -> None:
     ap.add_argument("--out-oof", required=True)
     ap.add_argument("--model-dir", default=None, help="Where to save fold models + meta.json for decide.py.")
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--num-leaves", type=int, default=None, help="Override LGB_PARAMS num_leaves.")
+    ap.add_argument("--learning-rate", type=float, default=None, help="Override LGB_PARAMS learning_rate.")
+    ap.add_argument("--min-data-in-leaf", type=int, default=None, help="Override LGB_PARAMS min_data_in_leaf.")
+    ap.add_argument("--num-boost-round", type=int, default=500)
+    ap.add_argument("--early-stopping-rounds", type=int, default=30)
     args = ap.parse_args()
 
+    lgb_params = dict(LGB_PARAMS)
+    if args.num_leaves is not None:
+        lgb_params["num_leaves"] = args.num_leaves
+    if args.learning_rate is not None:
+        lgb_params["learning_rate"] = args.learning_rate
+    if args.min_data_in_leaf is not None:
+        lgb_params["min_data_in_leaf"] = args.min_data_in_leaf
+
+    log(f"LGB params: {lgb_params}, num_boost_round={args.num_boost_round}, "
+        f"early_stopping_rounds={args.early_stopping_rounds}")
     log(f"Loading {args.features}...")
     df = read_features_parquet(args.features)
     feat_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
@@ -215,7 +231,10 @@ def main() -> None:
 
     memmap_dir = Path(args.out_oof).parent
     memmap_dir.mkdir(parents=True, exist_ok=True)
-    oof, importances, models = train_oof(df, feat_cols, n_splits=args.folds, memmap_dir=memmap_dir)
+    oof, importances, models = train_oof(
+        df, feat_cols, n_splits=args.folds, memmap_dir=memmap_dir, lgb_params=lgb_params,
+        num_boost_round=args.num_boost_round, early_stopping_rounds=args.early_stopping_rounds,
+    )
     df["oof_prob"] = oof
 
     imp = pd.Series(importances, index=feat_cols).sort_values(ascending=False)
