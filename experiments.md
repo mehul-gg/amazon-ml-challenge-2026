@@ -515,8 +515,36 @@ more predictable memory behavior at this scale, no more crashes after the switch
 remembering for future large-array dedup in this project: prefer sort+diff over `np.unique`
 when working with tens of millions of int64 keys.
 
-Running the full recompute (test pass, merge into merged6, features, rank features -> merged7,
-resample, retrain) next.
+Ran the full recompute: `candidate_pairs_{split}_merged6.tsv` (train 45,707,028 pairs / test
+35,868,318 pairs) -> `features_{split}_merged6.parquet` (raw similarity features) ->
+`features_{split}_merged7.parquet` (+ rank/context features) -> resampled 500k S1 -> retrained
+with the same tuned hyperparameters (num_leaves=63, min_data_in_leaf=30, learning_rate=0.04).
+
+**Result: OOF macro F0.5 0.7059 -> 0.7501 (+0.0442, tau=0.60)** — by far the single biggest
+jump of the session, more than 3x the previous largest gain (nospace's +0.0143). Confirms the
+miss-diagnosis-driven approach: methodically sampling and categorizing real misses (instead of
+guessing) found a pattern -- address matches exactly even when name normalization fails
+completely -- that turned out to carry far more signal than any of the name-based tricks tried
+before it.
+
+Hit one more crash regenerating features at this new scale: `features.py`'s
+`_build_gt_key_set` (a small, ~2.2M-row ground-truth explode, not the big candidate-pairs one)
+hit an `ArrayMemoryError` on a 59 MiB allocation despite 9+ GB free RAM reported moments later
+-- a transient peak within that one process's lifetime, not a system-wide shortage. Fixed by
+replacing that particular `pandas.explode()` call with a plain Python loop (fast enough at this
+row count, and this is now the third pandas-explode-related crash fixed this session by
+avoiding the explode/reindex/concat code path entirely at large-ish row counts under memory
+pressure).
+
+Regenerating and validating test predictions with this model next -- current best submission
+candidate.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> 0.7059 -> **0.7501**
+(baseline -> exact-match -> sorted-token -> rank/context -> LGB tuning -> nospace ->
+address-exact). Cumulative +0.0865 (+13.0% relative) over the first real submission. Blocking
+recall over the same progression: 56.10% -> 57.75% -> 59.02% -> (unchanged) -> (unchanged) ->
+61.47% -> **65.72%**.
 
 ## decide.py added + train.py now persists models (26 Sep)
 

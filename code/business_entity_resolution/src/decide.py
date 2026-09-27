@@ -59,19 +59,26 @@ def predict_ensemble(df: pd.DataFrame, models: list, feat_cols: list, batch_size
     so averaging all 5 for test inference carries no leakage risk (see train.py's
     train_oof docstring).
 
-    Batched; selects feat_cols ONCE before slicing (not per-batch — slicing rows on the full,
-    wider dataframe before narrowing columns crashed with MemoryError in train.py, same root
-    cause fixed there). Each batch IS cast to float32 explicitly — turns out that omission
-    was wrong, not the fix: LightGBM's internal pandas->numpy conversion picks a dtype wide
-    enough for whatever mix of column dtypes it's given, which meant float64 (8 bytes) for a
-    mixed float32/int32/bool frame, not float32 — confirmed as train.py's actual root cause
-    (6.73GB for one training fold). A batch here is small (5M rows) so casting it explicitly
-    is cheap and avoids that same internal upcast."""
-    X_all = df[feat_cols]
+    Each batch IS cast to float32 explicitly — turns out that omission was wrong, not the fix:
+    LightGBM's internal pandas->numpy conversion picks a dtype wide enough for whatever mix of
+    column dtypes it's given, which meant float64 (8 bytes) for a mixed float32/int32/bool
+    frame, not float32 — confirmed as train.py's actual root cause (6.73GB for one training
+    fold). A batch here is small (5M rows) so casting it explicitly is cheap and avoids that
+    same internal upcast.
+
+    Slices per-batch directly from `df` (rows AND columns together), not via a pre-sliced
+    `X_all = df[feat_cols]` computed once upfront: at merged7 scale (35.9M rows, 33 f_
+    columns) that single big column-select needed to materialize a >1GiB block in one shot and
+    hit an ArrayMemoryError despite several GB reported free elsewhere (likely fragmentation
+    after hours of heavy work in one session, not a hard limit). Slicing per-batch caps any
+    one allocation at batch_size rows instead. This is safe here specifically because `df`
+    (from read_features_parquet's column pushdown) is already narrow — feat_cols plus just 2
+    id columns — unlike train.py's original crash, which was row-slicing-then-column-selecting
+    on a genuinely wide, many-extra-column frame."""
     preds = np.zeros(len(df), dtype=np.float64)
     for start in range(0, len(df), batch_size):
         end = min(start + batch_size, len(df))
-        X_batch = X_all.iloc[start:end].astype(np.float32)
+        X_batch = df.iloc[start:end][feat_cols].astype(np.float32)
         for model in models:
             preds[start:end] += model.predict(X_batch, num_iteration=model.best_iteration) / len(models)
         del X_batch

@@ -196,13 +196,17 @@ def _build_gt_key_set(gt_path: Path, scope: set) -> set:
     and the full ground truth in memory together (see compute_and_write_features)."""
     gt = pd.read_csv(gt_path, sep="\t", dtype=str, keep_default_na=False)
     gt = gt[gt["source1_entity_id"].isin(scope)]
-    match_lists = gt["matched_entity_ids"].map(parse_id_list)
-    true_pairs = gt.assign(candidate_entity_id=match_lists).explode("candidate_entity_id")
-    true_pairs = true_pairs.loc[
-        true_pairs["candidate_entity_id"].notna() & (true_pairs["candidate_entity_id"] != ""),
-        ["source1_entity_id", "candidate_entity_id"],
+    # Flatten (s1, {matches}) rows into one key per match without pandas' explode() -- its
+    # internal reindex/concat path has now crashed with an ArrayMemoryError twice this session
+    # under transient memory pressure, even at this comparatively small (~2.2M-row) scale. A
+    # plain Python loop over match sets is fast here since most are tiny (1-5 items).
+    keys = [
+        f"{s1}\x01{cand}"
+        for s1, matches in zip(gt["source1_entity_id"], gt["matched_entity_ids"].map(parse_id_list))
+        for cand in matches
+        if cand
     ]
-    return set(true_pairs["source1_entity_id"] + "\x01" + true_pairs["candidate_entity_id"])
+    return set(keys)
 
 
 def _downcast_features(feat: pd.DataFrame) -> pd.DataFrame:
