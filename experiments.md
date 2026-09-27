@@ -264,6 +264,50 @@ improve recall.
 **Status: a complete, valid, submission-ready file exists at `output/matching_results.tsv` /
 `output/candidate_pairs.tsv`.** Uploading to the actual portal is the user's own action.
 
+## First real leaderboard score: public LB F0.5 = 0.658 (27 Sep morning)
+
+Uploaded the file above. **Public LB F0.5 = 0.658**, vs. OOF 0.6636 — only ~0.6% apart,
+confirming the GroupKFold + exact-metric threshold sweep is well-calibrated, not overfit to
+the training sample. Logged in `submissions.md`.
+
+## Exact-name-match supplementary blocking pass (27 Sep)
+
+Investigated real recall-miss cases (S1 entities whose true match is missing from candidates)
+by inspecting 20 actual examples rather than theorizing. Found a genuinely mixed bag:
+roughly a third were **fixable blocking-logic gaps**, not cases needing semantic embeddings —
+word reordering breaking bigram overlap (`orthopedic safe health` vs `orthopedic health safe`,
+zero shared bigrams despite identical words) and, more strikingly, **exact string matches still
+missing** (`krishna power` -> `krishna power`, `united agro` -> `united agro` — identical
+strings, dropped because the phrase is common enough to exceed even the rarest-token
+selection's effective reach). Full multilingual embeddings were separately sized at ~12.6h of
+CPU compute for the whole dataset — infeasible on the last day — so this cheaper, evidence-based
+fix was pursued first.
+
+**`exact_match_candidates.py`** (new): for each country, merge S1 and S2/S3 records on exact
+`name_core` — vectorized per-country merge, not a Python loop over groups (would have repeated
+blocking.py's original mistake). First uncapped run on train produced **75.2M pairs** — nearly
+double the entire existing candidate set — because a handful of very generic/short names
+(median group size 4, but max 1,359) dominate the count. Added `max_group_size=50` (mirrors
+blocking.py's `max_df`, just for whole-name groups instead of tokens): cut train to **6.1M pairs**
+(India 1.75M, US 4.35M), test to **5.0M pairs** (France 1.26M, India 1.64M, US 2.07M).
+
+**`merge_candidates.py`** (new): unions blocking.py's token/bigram candidates with the
+exact-match candidates, working entirely from flat parquet sources
+(`candidate_scores_{split}.parquet`, never the comma-joined TSV — re-exploding that at full
+scale crashed with MemoryError more than once already this project).
+
+**Measured recall gain on train: 56.10% -> 57.75% (+1.65pp)**, from combined pairs
+43.4M -> 44.46M (most exact-match pairs already existed in the token/bigram set).
+
+**Retrained on a fresh 500k-S1 sample of the merged candidates: OOF macro F0.5 = 0.6762 at
+τ=0.55** (up from 0.6636 at τ=0.50) — a genuine, real improvement matching the recall gain, not
+noise. Models saved to `artifacts/models_merged/`.
+
+Regenerated test predictions (`decide.py` with the new model + merged test candidates):
+1,732,544 rows, 451,981 predicted singletons (down from 461,068), 1,280,563 with a match (up
+from 1,271,476). **`utils/validate_submission.py --check-ids`: PASS.** New
+`output/matching_results.tsv` is ready — a second, improved submission, not yet uploaded.
+
 ## decide.py added + train.py now persists models (26 Sep)
 
 `train.py`'s `train_oof` only returned OOF predictions before — useless for inference on test
