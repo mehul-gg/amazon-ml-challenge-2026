@@ -91,10 +91,21 @@ INDIA_STATE_ABBREV = {
     "andhra pradesh": "ap", "arunachal pradesh": "ar", "assam": "as", "bihar": "br",
     "chhattisgarh": "cg", "goa": "ga", "gujarat": "gj", "haryana": "hr",
     "himachal pradesh": "hp", "jharkhand": "jh", "karnataka": "ka", "kerala": "kl",
+    "keralam": "kl",  # variant spelling seen in real data (transliteration, not abbreviation)
     "madhya pradesh": "mp", "maharashtra": "mh", "manipur": "mn", "meghalaya": "ml",
     "mizoram": "mz", "nagaland": "nl", "odisha": "or", "punjab": "pb", "rajasthan": "rj",
     "sikkim": "sk", "tamil nadu": "tn", "telangana": "tg", "tripura": "tr",
     "uttar pradesh": "up", "uttarakhand": "uk", "west bengal": "wb", "delhi": "dl",
+    # Native-script state names -- confirmed appearing as address suffixes in real misses
+    # (see diagnose_recall_misses.py samples in experiments.md), e.g. 'shivam developers':
+    # identical name, address differs ONLY in 'tg' vs 'తెలంగాణ'. basic_clean's accent-stripping
+    # only touches Latin combining marks, so these scripts pass through untouched otherwise.
+    "महाराष्ट्र": "mh", "उत्तर प्रदेश": "up", "राजस्थान": "rj", "गुजरात": "gj",
+    "बिहार": "br", "हरियाणा": "hr", "दिल्ली": "dl", "पंजाब": "pb", "केरल": "kl",
+    "तमिलनाडु": "tn", "मध्य प्रदेश": "mp", "झारखंड": "jh", "छत्तीसगढ़": "cg",
+    "उत्तराखंड": "uk", "हिमाचल प्रदेश": "hp", "असम": "as", "ओडिशा": "or", "गोवा": "ga",
+    "తెలంగాణ": "tg", "ఆంధ్రప్రదేశ్": "ap", "পশ্চিমবঙ্গ": "wb",
+    "ಕರ್ನಾಟಕ": "ka", "தமிழ்நாடு": "tn", "ગુજરાત": "gj", "কেরালা": "kl",
 }
 STATE_ABBREV = {**US_STATE_ABBREV, **INDIA_STATE_ABBREV}
 # Longest phrase first so "west bengal" matches before any shorter overlapping alternative.
