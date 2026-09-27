@@ -589,8 +589,22 @@ arguments actually are unique/sortable candidate-pair keys). Worth remembering: 
 dedup alone doesn't fully replace `np.unique()`-avoidance in `np.isin()` calls — need
 `assume_unique=True` too.
 
-Continuing the full recompute (merge -> merged8, features -> merged8/9, rank features,
-resample, retrain) to measure the real training impact.
+Ran the full recompute: `candidate_pairs_{split}_merged8.tsv` (train 46,229,295 pairs / test
+36,135,698 pairs) -> `features_{split}_merged8.parquet` (raw similarity features, now computed
+against the re-normalized address_clean) -> `features_{split}_merged9.parquet` (+ rank/context
+features) -> resampled 500k S1 -> retrained with the same tuned hyperparameters.
+
+**Result: OOF macro F0.5 0.7501 -> 0.7894 (+0.0393, tau=0.60)** — confirms the address
+normalization fix's +4.27pp recall gain (65.72% -> 69.99%) translated directly into classifier
+quality, not just noise reduction. Now within reach of the user's >0.8 target for the first
+time. Regenerating and validating test predictions with this model next.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> 0.7059 -> 0.7501 -> **0.7894**
+(baseline -> exact-match -> sorted-token -> rank/context -> LGB tuning -> nospace ->
+address-exact -> address-normalization-fix). Cumulative +0.1258 (+19.0% relative) over the
+first real submission. Blocking recall: 56.10% -> 57.75% -> 59.02% -> 61.47% -> 65.72% ->
+**69.99%**.
 
 ## decide.py added + train.py now persists models (26 Sep)
 
