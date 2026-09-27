@@ -9,12 +9,13 @@
 ## 1. Executive Summary
 
 We built a blocking-plus-classifier entity resolution pipeline: several cheap, complementary
-candidate-generation passes (inverted-index token/bigram blocking, plus five exact-key
+candidate-generation passes (inverted-index token/bigram blocking, plus six exact-key
 supplementary passes) feed a LightGBM classifier trained with rank/context features, followed
 by a hard exclusivity constraint at decision time. Our core innovation was a disciplined,
 evidence-driven loop — repeatedly sampling real ground-truth misses, categorizing the actual
 noise pattern behind them, and adding the cheapest fix that targets it — which took our
-out-of-fold macro F0.5 from 0.6636 to 0.7894+ without ever needing embeddings or external data.
+out-of-fold macro F0.5 from 0.6636 to **0.8278** without ever needing embeddings or external
+data.
 
 ---
 
@@ -56,7 +57,7 @@ features).
 
 ## 3. Candidate Generation (Blocking)
 
-Candidates for each S1 entity are the union of an inverted-index pass plus five cheap
+Candidates for each S1 entity are the union of an inverted-index pass plus six cheap
 supplementary exact-key passes, all scoped within-country (safe per the 100%-agreement fact
 above) and all capped by a `max_group_size` to avoid a handful of pathologically generic
 strings (e.g. a business named "meridian" shared by ~1,900 unrelated real records) blowing up
@@ -82,10 +83,14 @@ the candidate count.
 - **How we ensured true matches were not lost:** measured *exact* recall against the real
   ground truth after every single change (never estimated from a sample once real data was
   available), starting at 56.10% (token/bigram alone) and reaching **74.61%** after all six
-  passes plus a normalization fix (state-name canonicalization and leading-zero stripping in
-  address cleaning, which let the existing exact-address passes catch far more for free).
-  Every supplementary pass's incremental gain was measured in isolation before being folded in,
-  so we could tell which fixes were worth their recompute cost.
+  passes plus two normalization fixes in `normalize.py` (state-name canonicalization —
+  covering both Latin abbreviations and native-script full names in Devanagari, Telugu,
+  Bengali, Kannada, Tamil and Gujarati — plus leading-zero stripping on house numbers), which
+  let the existing exact-address and sorted-address passes catch far more for free without any
+  new blocking key. Every supplementary pass's incremental gain was measured in isolation
+  before being folded in, so we could tell which fixes were worth their recompute cost — the
+  address-based fixes alone (2 blocking passes + 2 normalization fixes) accounted for more than
+  half of the total recall improvement (56.10% -> 74.61%).
 
 ---
 
@@ -123,10 +128,8 @@ assigned to only its single highest-scoring S1 (dropping it from every other S1'
 ## 5. Results & Error Analysis
 
 - **F_0.5 Score (macro), OOF, exact competition metric:** progressed from **0.6636** (baseline:
-  token/bigram blocking only, untuned model) to **0.7894** across seven changes (see table),
-  a +19.0% relative improvement, entirely without embeddings or external data. [Update this
-  number to the final trained value once the last recompute round in progress finishes — see
-  `experiments.md` for the live log.]
+  token/bigram blocking only, untuned model) to **0.8278** across nine changes (see table), a
+  **+24.7% relative improvement**, entirely without embeddings or external data.
 
   | Change | OOF macro F0.5 | Blocking recall |
   |---|---|---|
@@ -138,6 +141,7 @@ assigned to only its single highest-scoring S1 (dropping it from every other S1'
   | + squashed-name (nospace) pass | 0.7059 | 61.47% |
   | + exact-address-match pass | 0.7501 | 65.72% |
   | + address normalization fix (state abbrev, leading zeros) | 0.7894 | 69.99% |
+  | + sorted-address-token pass + native-script state names | **0.8278** | **74.61%** |
 
 - **Common false positives (wrong merges):** near-generic short names ("family specialists",
   "northwind") that a naive uncapped exact-match blocking pass would have generated in bulk —

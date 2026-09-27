@@ -673,3 +673,52 @@ Two-part bug that would have silently corrupted every non-Latin-script name (Dev
 
 | Date | Change | Blocking recall | Avg candidates/S1 | OOF F0.5 (all / singletons / with matches) | Notes |
 |---|---|---|---|---|---|
+
+## Address-sorted-token pass + native-script state names: OOF F0.5 crosses 0.80 (27 Sep)
+
+A third `diagnose_recall_misses.py` pass (on the post-address-normalization-fix candidate set,
+69.99% recall) found two more concrete patterns: (1) **address token reordering** — the exact
+same tokens, different order (e.g. `'ward number 16 gandhi nagar...maharajganj up'` vs
+`'up maharajganj...ward number 16...gandhi nagar...'`) — directly covered by the *existing*
+`exact_match_candidates.py --key-mode sorted --key-column address_clean` combination, needing
+**zero new code**; and (2) **native-script state names** as address suffixes (e.g. `'shivam
+developers'`, identical name, address differing only in `'tg'` vs `'తెలంగాణ'`) — the earlier
+state-abbreviation fix only covered Latin-script full names.
+
+Ran the sorted-address-token pass: **+3.85pp recall** (69.99% -> 73.84%) — the third-largest
+single gain of the session. Extended `normalize.py`'s `INDIA_STATE_ABBREV` dict with
+native-script full names (Devanagari, Telugu, Bengali, Kannada, Tamil, Gujarati) for the states
+directly observed in misses — hit and fixed a self-inflicted bug along the way (two characters
+copy-pasted from the wrong Unicode script block, caught via a systematic script-consistency
+scan before it could silently corrupt data). Re-normalized all 6 source files, re-ran both
+address passes: **+0.77pp more** (73.84% -> 74.61%).
+
+Ran the full recompute on the combined result: `candidate_pairs_{split}_merged10.tsv` (train
+46,774,700 pairs / test 36,512,377 pairs) -> `features_{split}_merged10/11.parquet` -> resampled
+500k S1 -> retrained with the same tuned hyperparameters.
+
+**Result: OOF macro F0.5 0.7894 -> 0.8278 (+0.0384, tau=0.65) — first time crossing 0.80**, the
+target set explicitly for this improvement push.
+
+Hit a genuine disk-full crash partway through: `D:` filled to 100% (0 bytes free) from
+accumulating every intermediate parquet across 11 "merged" rounds this session — freed ~21GB
+by deleting clearly-superseded raw (pre-rank-features) feature files from rounds 1-8 (each
+already had a "+rank" successor that was what actually got used for training) plus the
+original pre-merge `_full.parquet` files and an abandoned 1M-S1 sample experiment. Also
+discovered mid-run that `C:` was independently at 98% full (3.8GB free) — likely the real
+root cause of several of this session's earlier "transient" memory slowdowns/crashes all
+night, since Windows' pagefile/virtual-memory commit backing typically lives there; the final
+training run completed successfully but visibly slowly under that pressure (~17,400
+cumulative CPU-seconds for a run that normally takes ~2,000). **This is a standing hardware/OS
+constraint on this machine, not something fixed by a code change** — worth clearing before any
+future session on this machine attempts full-scale work again.
+
+Regenerated and validated test predictions with this model (`models_merged11_500k`) — current
+best submission candidate.
+
+**Full night's progression, same metric family, comparable ~500k-S1 sample size:**
+0.6636 -> 0.6762 -> 0.6840 -> 0.6903 -> 0.6916 -> 0.7059 -> 0.7501 -> 0.7894 -> **0.8278**
+(baseline -> exact-match -> sorted-token -> rank/context -> LGB tuning -> nospace ->
+address-exact -> address-normalization-fix -> address-sorted+native-script-fix). Cumulative
++0.1642 (+24.7% relative) over the first real submission. Blocking recall: 56.10% -> 57.75% ->
+59.02% -> 61.47% -> 65.72% -> 69.99% -> **74.61%**.
