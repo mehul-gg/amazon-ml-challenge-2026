@@ -66,7 +66,8 @@ KEY_FNS = {
 
 
 def compute_exact_match_pairs(
-    artifacts_dir: Path, split: str, max_group_size: int = 50, key_mode: str = "exact"
+    artifacts_dir: Path, split: str, max_group_size: int = 50, key_mode: str = "exact",
+    key_column: str = "name_core",
 ) -> pd.DataFrame:
     """Returns columns [source1_entity_id, candidate_entity_id] — every (S1, candidate) pair
     sharing an exact key derived from name_core (see KEY_FNS: "exact" = the raw core name,
@@ -84,16 +85,16 @@ def compute_exact_match_pairs(
     mirrors blocking.py's max_df concept, just applied to whole-name (or sorted-token) groups
     instead of individual tokens."""
     key_fn = KEY_FNS[key_mode]
-    cols = ["entity_id", "country", "name_core"]
+    cols = ["entity_id", "country", key_column]
     s1_full = pd.read_parquet(artifacts_dir / f"norm_{split}_source1.parquet", columns=cols)
     s2_full = pd.read_parquet(artifacts_dir / f"norm_{split}_source2.parquet", columns=cols)
     s3_full = pd.read_parquet(artifacts_dir / f"norm_{split}_source3.parquet", columns=cols)
     cand_full = pd.concat([s2_full, s3_full], ignore_index=True)
     del s2_full, s3_full
-    s1_full = s1_full[s1_full["name_core"] != ""]
-    cand_full = cand_full[cand_full["name_core"] != ""]
-    s1_full = s1_full.assign(key=s1_full["name_core"].map(key_fn))
-    cand_full = cand_full.assign(key=cand_full["name_core"].map(key_fn))
+    s1_full = s1_full[s1_full[key_column] != ""]
+    cand_full = cand_full[cand_full[key_column] != ""]
+    s1_full = s1_full.assign(key=s1_full[key_column].map(key_fn))
+    cand_full = cand_full.assign(key=cand_full[key_column].map(key_fn))
 
     results = []
     countries = sorted(set(s1_full["country"]) & set(cand_full["country"]))
@@ -130,6 +131,11 @@ def main() -> None:
                      help="'exact' = raw core name; 'sorted' = word-order-independent "
                           "(catches pure reordering, e.g. 'a b c' matches 'c a b').")
     ap.add_argument("--max-group-size", type=int, default=50)
+    ap.add_argument("--key-column", choices=["name_core", "address_clean"], default="name_core",
+                     help="'address_clean' targets cases where the name is unrecoverable "
+                          "(e.g. transliteration) but the address string matches exactly -- "
+                          "addresses are far more specific than short business names, so much "
+                          "less prone to the generic-collision problem name-based keys hit.")
     ap.add_argument("--out", default=None)
     ap.add_argument("--measure-recall-gain", action="store_true",
                      help="Train only: report how much this ADDS to existing blocking recall.")
@@ -142,10 +148,11 @@ def main() -> None:
     args = ap.parse_args()
 
     artifacts_dir = Path(args.artifacts)
-    log(f"Computing {args.key_mode}-match candidates for {args.split}...")
-    pairs = compute_exact_match_pairs(artifacts_dir, args.split, args.max_group_size, args.key_mode)
+    tag = args.key_mode if args.key_column == "name_core" else f"{args.key_column}_{args.key_mode}"
+    log(f"Computing {tag}-match candidates for {args.split}...")
+    pairs = compute_exact_match_pairs(artifacts_dir, args.split, args.max_group_size, args.key_mode, args.key_column)
 
-    out_path = Path(args.out) if args.out else artifacts_dir / f"{args.key_mode}_match_pairs_{args.split}.parquet"
+    out_path = Path(args.out) if args.out else artifacts_dir / f"{tag}_match_pairs_{args.split}.parquet"
     pairs.to_parquet(out_path, index=False)
     log(f"Wrote {len(pairs):,} exact-match pairs to {out_path}")
 

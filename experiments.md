@@ -477,9 +477,46 @@ Cumulative +0.0423 (+6.4% relative) over the first real submission. Blocking rec
 same progression: 56.10% -> 57.75% -> 59.02% -> (unchanged) -> (unchanged) -> 61.47%.
 
 **Negative/neutral results from the same session, for completeness:** training on 2x the data
-(500k->1M S1) gave only +0.0008 (not the bottleneck); the still-unexplained `max_group_size=50`
-genericity-cap drops on literally-identical names (northwind, viis, family specialists — see
-the nospace-pass entry above) remain unfixed, a candidate for a future session.
+(500k->1M S1) gave only +0.0008 (not the bottleneck).
+
+## Generic-name cap investigated and rejected; address-exact pass added (+4.25pp, biggest gain)
+
+Checked whether raising `max_group_size` (currently 50) would safely rescue the literally-
+identical-name misses noted earlier (northwind, viis, family specialists, uptown pub, new
+delhi foundation). Measured their actual group sizes: 948, 59, 690, 256, 109 respectively —
+these are common template-style names shared by hundreds of genuinely unrelated real
+businesses, not near-duplicates. Confirmed via the full group-size distribution: 8,641 groups
+in the 51-200 "rescue zone" alone (864,550 records), with pathological outliers up to 1,897
+("meridian"). Raising the cap would flood the candidate set with false positives for a
+precision-weighted metric — **rejected**, the current cap is doing its job correctly.
+
+Instead targeted the OTHER bucket from the miss diagnosis: transliteration cases where the
+address genuinely matches but the name doesn't (translated/transliterated to a different
+script). Generalized `exact_match_candidates.py` to take `--key-column` (name_core or
+address_clean) instead of hardcoding name_core. Checked the address_clean group-size
+distribution first: max group size only 41 (mean 1.23) vs. name's max of 1,897 — addresses are
+inherently far more specific, so an exact-match pass on them carries none of the genericity
+risk name-based keys do. No cap needed in practice at max_group_size=50 (nothing gets dropped).
+
+**Measured recall gain: 61.47% -> 65.72%, +4.25pp** — from only 1,137,922 new pairs (vs. 6-6.5M
+for each of the name-based passes). By far the most efficient and highest-value pass of the
+session: a fraction of the pairs, more than 1.5x the recall gain of the next-best pass
+(nospace, +2.45pp). Confirms the hypothesis from the miss diagnosis: many "unrecoverable"
+name-based misses (transliteration, heavy typos, completely different trade names for the same
+business) still have a clean, exact address match — address is the more robust signal exactly
+when name normalization/matching breaks down.
+
+Hit two more `MemoryError`/`ArrayMemoryError` crashes measuring this — this time in
+`np.unique()`'s internal hash-based dedup path on ~60-70M-element int64 arrays, despite 7-9GB
+of free RAM reported at the time (likely virtual-memory fragmentation after many hours of
+heavy pandas/numpy work in this session, not a hard resource ceiling). Fixed by switching to a
+sort-based dedup (in-place `.sort()` + boolean diff) instead of `np.unique`'s hash-table path —
+more predictable memory behavior at this scale, no more crashes after the switch. Worth
+remembering for future large-array dedup in this project: prefer sort+diff over `np.unique`
+when working with tens of millions of int64 keys.
+
+Running the full recompute (test pass, merge into merged6, features, rank features -> merged7,
+resample, retrain) next.
 
 ## decide.py added + train.py now persists models (26 Sep)
 
